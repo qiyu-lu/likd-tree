@@ -27,6 +27,7 @@ For details see [Python Usage](#python-usage)
 - **🪶 Lightweight**: Header-only library (~450 lines of clean C++17) - no build required
 - **⚡ Fast**: 2.44x faster incremental insertion than ikd-tree
 - **🧠 Intelligent**: Smarter rebalance strategy with delayed and batched rebuilding of multiple non-overlapping unbalanced subtrees *(paper-worthy?)* 
+- **🔧 Flexible**: Support for custom point types via PointTraits template - use any point representation (arrays, getters, etc.)
 
 ## 📊 Performance Comparison
 
@@ -92,6 +93,38 @@ tree.nearestNeighbors(queries, results, distances);
 
 **To disable TBB (sequential execution):**
 - Simply don't define `LIKD_TREE_USE_TBB`, or comment it out
+
+### Custom Point Types
+
+likd-tree supports arbitrary point types through the `PointTraits` template. By default, it works with point types that have `x`, `y`, `z` members, but you can easily customize it:
+
+```cpp
+// Your custom point type using an array
+struct MyPoint {
+  float coords[3];
+};
+
+// Specialize PointTraits for your point type
+template <>
+struct PointTraits<MyPoint> {
+  static constexpr int DIM = 3;  // your custom point dimensionality
+  
+  static inline float coord(const MyPoint& pt, int axis) {
+    return pt.coords[axis];
+  }
+  static inline float sqrDist(const MyPoint& a, const MyPoint& b) {
+    float dx = a.coords[0] - b.coords[0];
+    float dy = a.coords[1] - b.coords[1];
+    float dz = a.coords[2] - b.coords[2];
+    return dx * dx + dy * dy + dz * dz;
+  }
+};
+
+// Use it like any other point type
+KDTree<MyPoint> tree;
+```
+
+For detailed examples with different point representations (arrays, getters, etc.), see [test/demo.cpp](test/demo.cpp).
 
 
 ### Python Usage
