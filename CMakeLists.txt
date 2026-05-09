@@ -73,8 +73,17 @@ if(LIKD_TREE_PCL_VISUALIZATION_FOUND)
     ${LIKD_TREE_PCL_LIBRARIES}
     Threads::Threads
   )
+
+  add_executable(radius_search_pcd_demo
+    test/radius_search_pcd_demo.cpp
+  )
+  target_link_libraries(radius_search_pcd_demo
+    kdtree
+    ${LIKD_TREE_PCL_LIBRARIES}
+    Threads::Threads
+  )
 else()
-  message(STATUS "nearest_search_pcd_demo disabled. Install PCL visualization to enable it.")
+  message(STATUS "PCD visualization demos disabled. Install PCL visualization to enable them.")
 endif()
 
 # Benchmark executable (only built with -DBUILD_BENCHMARK=ON)

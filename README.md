@@ -85,6 +85,11 @@ PointVector<PointType> queries = {...};
 PointVector<PointType> results;
 std::vector<float> distances;
 tree.nearestNeighbors(queries, results, distances);
+
+// Radius search
+PointType query;
+float radius = 2.0f;
+tree.radiusSearch(query, radius, results, distances);
 ```
 
 **To enable TBB parallel acceleration:**
@@ -170,8 +175,10 @@ cmake --build build
 
 ### Nearest Neighbor Search on PCD
 
-If PCL visualization is available, CMake also builds a PCD-based nearest
-neighbor demo:
+If PCL visualization is available, CMake also builds PCD-based nearest
+neighbor and radius search demos.
+
+For nearest neighbor search:
 
 ```bash
 cmake -B build
@@ -203,7 +210,7 @@ Brute-force check: MATCH
 ```
 
 In the visualization, the original cloud is shown in gray, the query point in
-green, the nearest neighbor in red, and the line between them in yellow.
+green, the nearest neighbor in red, and the line between them in yellow:
 
 ![nearest-search-pcd](imgs/nearest_search_pcd_result.png)
 
@@ -211,6 +218,48 @@ For terminal-only validation without opening a viewer, pass `--no-vis`:
 
 ```bash
 ./build/nearest_search_pcd_demo <map.pcd> <qx> <qy> <qz> --no-vis
+```
+
+For radius search:
+
+```bash
+cmake -B build
+cmake --build build --target radius_search_pcd_demo
+./build/radius_search_pcd_demo <map.pcd> <qx> <qy> <qz> <radius>
+```
+
+Example:
+
+```bash
+./build/radius_search_pcd_demo ./test/pcd/globalMap.pcd 0.9 0.1 0 2.0
+```
+
+The radius demo prints the number of points found, validates the result with
+brute-force search, and visualizes the query point in green, matched radius
+points in red, and the search radius as a green wireframe sphere:
+
+![radius-search-pcd](imgs/radius_search_pcd_result.png)
+
+Example output:
+
+```text
+Loaded points: 1742788
+Finite points used: 1742788
+Build time: 330.332208 ms
+Radius search time: 0.029950 ms
+Query: (0.900000, 0.100000, 0.000000)
+Radius: 2.000000
+Radius search points: 193
+Brute-force points: 193
+Nearest radius result distance: 1.381566
+Farthest radius result distance: 1.999513
+Brute-force check: MATCH
+```
+
+For terminal-only validation:
+
+```bash
+./build/radius_search_pcd_demo <map.pcd> <qx> <qy> <qz> <radius> --no-vis
 ```
 
 ### Run Benchmark (Compare with ikd-tree)
@@ -237,6 +286,6 @@ cmake --build build
 **Planned Features:**
 - [ ] Node deletion support (Node deletion not supported now)
 - [ ] k-nearest neighbors (k-NN) query
-- [ ] box/radius queries
+- [ ] box queries
 
 > **Note:** If you require these features immediately, consider using [ikd-tree](https://github.com/hku-mars/ikd-Tree) instead.

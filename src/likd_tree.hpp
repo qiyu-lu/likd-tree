@@ -9,10 +9,14 @@ Distributed under MIT license. See LICENSE for more information.
 #pragma once
 
 #include <Eigen/Core>
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cmath>
 #include <execution>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
@@ -78,6 +82,9 @@ class KDTree {
   void nearestNeighbors(const PointVector<PointType>& queries,
                         PointVector<PointType>& results,
                         std::vector<float>& distances) const;
+  void radiusSearch(const PointType& query, float radius,
+                    PointVector<PointType>& results,
+                    std::vector<float>& distances) const;
   int size() const;
 
  private:
@@ -91,6 +98,9 @@ class KDTree {
   void nearestNeighborInternal(Node* node, const PointType& query,
                                const PointType*& best_pt,
                                float& best_dist2) const;
+  void radiusSearchInternal(Node* node, const PointType& query, float radius2,
+                            PointVector<PointType>& results,
+                            std::vector<float>& distances2) const;
   bool checkAncestorNeedsRebuild(Node* node) const;
   void backgroundRebuild(std::vector<Node*> nodes_to_rebuild);
   void insertPendingPoints();
@@ -262,6 +272,55 @@ void KDTree<PointType, Traits>::nearestNeighbors(
 }
 
 template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::radiusSearch(
+    const PointType& query, float radius, PointVector<PointType>& results,
+    std::vector<float>& distances) const {
+  results.clear();
+  distances.clear();
+
+  if (radius < 0.0f) {
+    return;
+  }
+
+  std::shared_lock<std::shared_mutex> lock(tree_mutex_);
+  if (root_ == nullptr) {
+    return;
+  }
+
+  const float radius2 = radius * radius;
+  radiusSearchInternal(root_, query, radius2, results, distances);
+
+  std::vector<size_t> indices(results.size());
+  std::iota(indices.begin(), indices.end(), 0);
+  std::sort(indices.begin(), indices.end(), [&](size_t lhs, size_t rhs) {
+    if (distances[lhs] != distances[rhs]) {
+      return distances[lhs] < distances[rhs];
+    }
+    for (int axis = 0; axis < Traits::DIM; ++axis) {
+      float lhs_coord = Traits::coord(results[lhs], axis);
+      float rhs_coord = Traits::coord(results[rhs], axis);
+      if (lhs_coord != rhs_coord) {
+        return lhs_coord < rhs_coord;
+      }
+    }
+    return false;
+  });
+
+  PointVector<PointType> sorted_results;
+  sorted_results.reserve(results.size());
+  std::vector<float> sorted_distances;
+  sorted_distances.reserve(distances.size());
+
+  for (size_t index : indices) {
+    sorted_results.push_back(results[index]);
+    sorted_distances.push_back(std::sqrt(distances[index]));
+  }
+
+  results.swap(sorted_results);
+  distances.swap(sorted_distances);
+}
+
+template <typename PointType, typename Traits>
 int KDTree<PointType, Traits>::size() const {
   return root_ ? root_->subtree_size : 0;
 }
@@ -375,6 +434,23 @@ void KDTree<PointType, Traits>::nearestNeighborInternal(
     nearestNeighborInternal(near, query, best_pt, best_dist2);
   if (far && far->aabb.sqrDist(query) < best_dist2)
     nearestNeighborInternal(far, query, best_pt, best_dist2);
+}
+
+template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::radiusSearchInternal(
+    Node* node, const PointType& query, float radius2,
+    PointVector<PointType>& results, std::vector<float>& distances2) const {
+  if (!node || node->aabb.sqrDist(query) > radius2)
+    return;
+
+  float d2 = Traits::sqrDist(node->point, query);
+  if (d2 <= radius2) {
+    results.push_back(node->point);
+    distances2.push_back(d2);
+  }
+
+  radiusSearchInternal(node->left, query, radius2, results, distances2);
+  radiusSearchInternal(node->right, query, radius2, results, distances2);
 }
 
 template <typename PointType, typename Traits>
