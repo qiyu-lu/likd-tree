@@ -62,7 +62,8 @@ For details see [Python Usage](#python-usage)
 
 - **🔄 Incremental**: Dynamic point insertion and deletion (by point or by box) with automatic background rebalancing
 - **🔍 Queries**: Nearest neighbor, k-nearest neighbors, radius and box search
-- **🪶 Lightweight**: Header-only library (~1400 lines of C++17) - no build required
+- **⏱️ Time-aware (optional)**: Per-point stamps to refresh the points a scan sees again, expire those not seen for a while, and query only recent ones, in the spirit of Redis' LRU and TTL
+- **🪶 Lightweight**: Header-only library (~2100 lines of C++17) - no build required
 - **📦 Compact**: About 25 bytes per `pcl::PointXYZ` point, a sixth of ikd-tree's: points are stored in leaf buckets
 - **⚡ Fast**: On a 1.3M-point LiDAR map streamed in scan-sized frames, 3.9x faster incremental insertion, 5.4x faster 5-NN search and 30x faster box deletion than ikd-tree
 - **🧠 Intelligent**: Smarter rebalance strategy with delayed and batched rebuilding of multiple non-overlapping unbalanced subtrees *(paper-worthy?)* 
@@ -203,6 +204,38 @@ tree.deleteBox(box);
 int n = tree.size();
 size_t bytes = tree.memoryUsage();
 ```
+
+**Stamps (optional):** with `TRACK_STAMPS`, every point keeps a stamp, a
+frame number or a time in any unit that never decreases or wraps.
+
+```cpp
+struct StampedOptions : DefaultOptions {
+  static constexpr bool TRACK_STAMPS = true;
+};
+using StampedTree = KDTree<PointType, PointTraits<PointType>, StampedOptions>;
+using Stamp = StampedTree::Stamp;
+
+StampedTree map;
+map.addPoints(scan, Stamp{frame});         // insert, stamped with the frame
+map.touchPoints(neighbors, Stamp{frame});  // seen or used again: refresh
+map.expireBefore(Stamp{frame - 100});      // drop what was not seen in 100 frames
+
+StampedTree::SearchOptions recent;
+recent.min_stamp = Stamp{frame - 10};      // only points seen in the last 10
+map.knnSearch(query, 5, results, distances, recent);
+```
+
+- Points written without a stamp get `Stamp::kNever`, the largest value: they
+  never expire, and `min_stamp` never hides them.
+- `touchPoints` raises the stamp of every stored copy of each point (exact
+  coordinates) and never lowers one. With copies of a point stamped
+  differently, `deletePoints` removes the oldest.
+- Touches and expiries are writes like the others: queued in order while a
+  rebuild runs.
+- Stamps cost about 5–7 bytes per point on the test maps, mostly 4 bytes per
+  leaf slot. Without `TRACK_STAMPS`, the tree has the same layout and speed as
+  before, and calling the functions above with a `Stamp`, or setting
+  `min_stamp`, is a compile error.
 
 **To enable TBB parallel acceleration:**
 - Add `#define LIKD_TREE_USE_TBB` before including `likd_tree.hpp`
