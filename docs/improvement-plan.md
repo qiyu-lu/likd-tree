@@ -411,6 +411,48 @@ class KDTree {
 - **检查**：单元测试、TSan、ASan + UBSan 全部通过。Phase 1 压缩那次提交（`bfc6204`）没有重跑 TBB 版的 ASan + UBSan，这次一起补上。
 - 某项达不到，或者修法需要改动不变量时，停下来报告。
 
+### 5.11 Phase 3 之前：查询选项与不排序的 radiusSearch
+
+用户在 5.10 验收后安排的单独一步，设计由用户给定。
+
+**动机**：`radiusSearch` 把结果按距离排序后返回，每次返回的点多时，排序占了大头。执行方的临时程序在 globalMap 上测得（2 万次查询，单线程）：
+
+| 每次返回的点数 | 排序（现在） | 不排序 | ikd-tree（不排序） |
+|---|---|---|---|
+| 82（r = 1 m） | 108 ms | 55 ms | 210 ms |
+| 2625（r = 5 m） | 2679 ms | 438 ms | 1297 ms |
+
+PCL（`setSortedResults`）和 nanoflann（`SearchParameters::sorted`）都提供同样的开关。
+
+**设计**：
+
+```cpp
+  // Options for the queries that take them. Each field applies to some
+  // queries only and is ignored by the others.
+  struct SearchOptions {
+    float max_dist = INFINITY;  // knnSearch: skip points farther than this
+    bool sorted = true;         // radiusSearch: sort the results by distance
+  };
+```
+
+- **嵌套在 `KDTree` 里**：Phase 3 的 `min_stamp` 只在 `TRACK_STAMPS` 为真时存在（7.4），这取决于 `Options`。
+- **四类查询的六个公开函数各加一个接受 `const SearchOptions&` 的重载**，现有签名保留，内部转调，已有代码不用改。
+  - `nearestNeighbors` 和 `knnSearch` 各有单个和批量两个版本，批量版本也加：按 7.9 第 6 条的决定，Phase 3 的 `min_stamp` 要通过 `SearchOptions` 传给批量查询。
+  - 新重载的 `SearchOptions` 参数没有默认值，否则 `knnSearch(q, k, res, d)` 会与现有签名二义。
+- **`sorted = false`**：`radiusSearch` 跳过排序，按遍历顺序返回，距离照常给出。
+- **字段按名字设置**（`opts.sorted = false;`）。Phase 3 会给 `SearchOptions` 加一个条件基类，按位置的聚合初始化（`SearchOptions{2.0f, false}`）到时会失效，README 里只给按名字设置的写法。
+
+**测试**：不排序的结果与排序的结果是同一个集合（按坐标排序后逐个比较，距离与点对应）；其余查询带 `SearchOptions` 的结果与原签名相同。
+
+**benchmark**：Part 1 在 radius 一行之后增加一行不排序的 radius 查询，同样 2 万次，与 ikd-tree 的同一次计时对比；两者找到的点数必须相同。
+
+**验收**：按 5.7 的测法（交替各 10 次，随机点、globalMap、sparse），现有各项回退不超过 5%。
+
+**提交**：
+
+1. `Add SearchOptions and an unsorted radius search`：库、测试、README。
+2. `Benchmark the unsorted radius search`。
+
 ## 6. Phase 2：重建期间写入立即可见（已关闭）
 
 **已关闭，不做**（2026-10-04，用户转达的审阅决定）。Phase 1 之后，排队写入的最长等待从约 50–70 ms 降到约 6 ms（globalMap 6.5 ms，sparse 6.2 ms，约为 10 Hz 下一帧的 6%），读到旧地图的比例 globalMap 为 0.00%，sparse 为 0.03%。下面的快照加日志回放方案会明显增加并发协议的复杂度，已经不值得做。原来的分析保留在下面供以后参考；5.10 的修复对这几项指标的影响见“结果记录”。
@@ -467,7 +509,7 @@ class KDTree {
 - **带 `min_stamp` 的查询**：在 `t_max < min_stamp` 的子树处剪枝，叶内逐点比较时间戳。没有惰性刷新标记，不需要沿路径携带额外状态。
 - **`touchPoints`**：按坐标精确查找，与按点删除走同一条下降路径。
   - 开销是这一阶段的主要风险：按“配准用到的近邻都刷新”的用法，每帧要刷新约 5 × 帧点数个点，每个点一次按 AABB 的下降，都在独占锁内。
-  - 如果达不到 7.3 的上限，再考虑叶子级时间戳（每个叶子一个时间戳，粒度相当于 iVox 的体素级 LRU）。
+  - 按 7.9 第 2 条的决定：先对输入去重；不做共同下降，也不做句柄。叶子的 `[t_min, t_max]` 没有变化时，不更新祖先。
 - **剪枝效果**：取决于时间与空间的相关性。机器人在移动时效果好；原地静止时会退化成逐叶扫描时间戳数组。最坏情况下全图约 170 万次比较，量级在 1 ms，可以接受。
 
 ### 7.3 测试与验收
@@ -475,13 +517,15 @@ class KDTree {
 - **正确性**：建立带时间戳的暴力参考模型；随机混合执行 add / touch / expire / delete 后，对比所有查询结果和 `size()`。`validate()` 增加对 `[t_min, t_max]` 的检查。
 - **关闭开关时**：benchmark 结果与 Phase 1 的差异在噪声范围内（±5%）。
 - **开启开关时**：
-  - 内存增量不超过 5 B/点（按现在的布局达不到，见 7.9 第 1 条）；
+  - 内存增量不超过 6.5 B/点（原为 5 B/点，按 7.9 第 1 条的决定修改）；
   - 在流式地图上，`expireBefore` 与同等删除量的 box 删除耗时处于同一量级；
-  - `touchPoints`：benchmark 每帧刷新该帧 5-NN 查询返回的全部近邻，每帧耗时不超过同帧插入耗时的 3 倍（估算略超，见 7.9 第 2 条）。
+  - `touchPoints`：Part 2 每帧刷新该帧 5-NN 查询返回的全部近邻，每帧耗时的最慢 1% 平均不超过 5 ms，globalMap 和 sparse 都要满足；与同帧插入耗时之比只报告，不作标准（原为“不超过同帧插入耗时的 3 倍”，按 7.9 第 2 条的决定修改）。
 
 Phase 3 开工前，执行方按 Phase 1 的实际结构把本节补全（接口签名、`Op` 的布局、提交拆分），再审一次。补全的内容见 7.4–7.9（执行方，2026-10-04），其中 7.9 列出需要审阅方决定的问题。
 
 ### 7.4 接口签名
+
+按 7.9 的决定同步（2026-10-04）。
 
 开关和时间戳类型：
 
@@ -495,60 +539,58 @@ struct DefaultOptions {
 template <typename PointType, typename Traits, typename Options>
 class KDTree {
  public:
-  // A frame number or a time, in any unit that never decreases or wraps
+  // A frame number or a time, in any unit that never decreases or wraps.
+  // The largest value, kNever, means the point never expires: writes
+  // without a stamp use it.
   struct Stamp {
+    static constexpr uint32_t kNever = UINT32_MAX;
     uint32_t value = 0;
   };
   ...
 };
 ```
 
-- **`Stamp` 是独立类型，不直接用 `uint32_t`**。`addPoints(pts, wait_for_rebuild)` 的第二个参数是 `bool`。如果时间戳是整数，`addPoints(pts, frame)` 在 `frame` 为 `int` 时与 `bool` 重载二义，`frame` 为 `bool` 时会静默选中不带时间戳的重载。独立类型让两者在编译期分开。
+- **`Stamp` 是独立类型，不直接用 `uint32_t`**（第 3 条决定）。`addPoints(pts, wait_for_rebuild)` 的第二个参数是 `bool`。如果时间戳是整数，`addPoints(pts, frame)` 在 `frame` 为 `int` 时与 `bool` 重载二义，`frame` 为 `bool` 时会静默选中不带时间戳的重载。独立类型让两者在编译期分开。
 - **嵌套在 `KDTree` 里**，与 `AABB` 一致，不往全局命名空间里加 `Stamp` 这样的通用名字。
+- **最大值 `Stamp::kNever` 表示永不过期**（第 4 条决定）：`expireBefore` 只删除时间戳小于阈值的点，带 `min_stamp` 的查询只跳过时间戳小于 `min_stamp` 的点，所以带这个值的点永远不会过期，也总能被查到。
 
-只在 `TRACK_STAMPS` 为真时存在的写接口（成员模板加 `std::enable_if_t`，关闭开关时调用是编译错误）：
+只在 `TRACK_STAMPS` 为真时可用的写接口。关闭开关时调用它们是编译错误：函数体里有 `static_assert`，类模板的成员只在被调用时才实例化。
 
 ```cpp
   void build(const PointVector<PointType>& pts, Stamp stamp);
   void addPoints(const PointVector<PointType>& pts, Stamp stamp,
                  bool wait_for_rebuild = false);
   // Raises the stamp of every stored copy of each point (exact coordinates)
-  // to `stamp`; copies with a newer stamp keep it.
+  // to `stamp`; copies with a newer stamp keep it. Duplicate points in
+  // `pts` are dropped first.
   void touchPoints(const PointVector<PointType>& pts, Stamp stamp,
                    bool wait_for_rebuild = false);
   // Deletes every point whose stamp is older than `stamp`.
   void expireBefore(Stamp stamp, bool wait_for_rebuild = false);
 ```
 
-带 `min_stamp` 的查询，同样只在开启时存在。时间戳早于 `min_stamp` 的点视为不存在：
+带 `min_stamp` 的查询（第 6 条决定）：不加单独的重载。`min_stamp` 是 `SearchOptions`（5.11）的字段，只在开启开关时存在，关闭时使用它是编译错误；通过各查询接受 `SearchOptions` 的重载传入。时间戳早于 `min_stamp` 的点视为不存在：
 
 ```cpp
-  std::pair<std::optional<PointType>, float> nearestNeighbors(
-      const PointType& query, Stamp min_stamp) const;
-  void nearestNeighbors(const PointVector<PointType>& queries,
-                        PointVector<PointType>& results,
-                        std::vector<float>& distances, Stamp min_stamp) const;
-  void radiusSearch(const PointType& query, float radius,
-                    PointVector<PointType>& results,
-                    std::vector<float>& distances, Stamp min_stamp) const;
-  void knnSearch(const PointType& query, int k, PointVector<PointType>& results,
-                 std::vector<float>& distances, float max_dist,
-                 Stamp min_stamp) const;
-  void knnSearch(const PointVector<PointType>& queries, int k,
-                 std::vector<PointVector<PointType>>& results,
-                 std::vector<std::vector<float>>& distances, float max_dist,
-                 Stamp min_stamp) const;
-  void boxSearch(const AABB& box, PointVector<PointType>& results,
-                 Stamp min_stamp) const;
+  struct NoStampFilter {};
+  struct StampFilter {
+    Stamp min_stamp;  // skip points stamped earlier; the default skips none
+  };
+  struct SearchOptions
+      : std::conditional_t<TRACK_STAMPS, StampFilter, NoStampFilter> {
+    float max_dist = INFINITY;  // knnSearch
+    bool sorted = true;         // radiusSearch
+  };
 ```
 
 已有接口在开启开关时的语义：
 
-- **不带时间戳的 `build(pts)` 和 `addPoints(pts, wait)`**：点的时间戳取 `Stamp` 的最大值，永不过期，对应 Redis 中没有设置 TTL 的键。这样已有的全部单元测试可以原样在开启开关的实例上运行。
-- **`deletePoints`**：开启时删除时间戳最旧的那份拷贝；关闭时照旧删除先找到的一份。有重复点时，删掉哪一份会影响以后的过期，规定为最旧的一份，暴力模型才能精确对照。
+- **不带时间戳的 `build(pts)` 和 `addPoints(pts, wait)`**：点的时间戳取 `Stamp::kNever`，永不过期，对应 Redis 中没有设置 TTL 的键（第 4 条决定）。这样已有的全部单元测试可以原样在开启开关的实例上运行。
+- **`deletePoints`**：开启时删除时间戳最旧的那份拷贝；关闭时照旧删除先找到的一份（第 5 条决定）。有重复点时，删掉哪一份会影响以后的过期，规定为最旧的一份，暴力模型才能精确对照。
+- **`touchPoints`** 先对输入按坐标去重，再逐点查找（第 2 条决定）。
 - **不带 `min_stamp` 的查询**行为不变。`size()` 仍是未删除的点数，与时间戳无关。
 
-内部的查询函数和 `collect` 增加 `uint32_t min_stamp` 参数。关闭开关时它恒为 0，相关判断用 `if constexpr` 去掉。
+内部的查询函数和 `collect` 增加 `min_stamp` 参数。关闭开关时它恒为 0，相关判断用 `if constexpr` 去掉；开启开关但 `min_stamp` 为 0 时，查询走不检查时间戳的那份实例。
 
 ### 7.5 数据布局
 
@@ -628,8 +670,9 @@ Phase 1 的惰性标记只有一种，即整树删除的 `tree_deleted`；v2 去
    - `validate()` 对带标记的子树只检查标记节点自身（`valid == 0`，包围盒和时间戳范围都为空），与 5.6 的规则一致。
 3. **`expireBefore` 复用同一个标记，不新增标记类型**：`t_max < T` 的子树直接 `killSubtree`（内部节点打标记，叶子把所有槽置删除位），O(1)；之后照常 `markIfUnbalanced`。删除比例超过一半的子树由重建回收，与 box 删除完全相同。
 4. **touch 只会提高时间戳**：
-   - 叶内改完后 `updateLeaf` 重算；被刷新的点若恰好是最小值，`t_min` 会上升。
-   - 祖先沿递归路径 `updateInner`，O(深度)，与按点删除相同。
+   - 叶内改完后重算叶子的 `[t_min, t_max]`；被刷新的点若恰好是最小值，`t_min` 会上升。
+   - 祖先沿递归路径更新 `[t_min, t_max]`，O(深度)。touch 不改变 `aabb`、`size` 和 `valid`，只需要合并子节点的时间戳范围。
+   - 叶子的 `[t_min, t_max]` 没有变化时，不更新祖先（7.9 第 2 条允许的优化）；同理，某个祖先的范围没有变化时，更上层的祖先也不必更新。
 5. **重建收集时带着时间戳**：worker 无锁读取旧子树的时间戳，依据与 5.3 的不变量 3 相同（重建期间的写入都进队列）。
 6. **队列的顺序决定语义**：touch 和 expire 在重建期间照常排队，按调用顺序回放；5.10 的分块与回放中断对它们同样适用。例如，先排队的 touch 能让点躲过随后排队的 expire，顺序反过来就不能。这类顺序由 7.3 的差分测试覆盖，测试中写操作不等待重建，大量操作会经过队列。
 7. **失衡判据不变**：时间戳不影响平衡，expire 只通过删除比例影响重建。
@@ -640,7 +683,7 @@ Phase 1 的惰性标记只有一种，即整树删除的 `tree_deleted`；v2 去
    - 内容：`Options::TRACK_STAMPS`、`Stamp`、条件基类、`StampedLeaf`、带时间戳的 `build` 和 `addPoints`、`Op` 的时间戳字段；分裂、压缩、重建都携带时间戳；`validate()` 检查 `[t_min, t_max]`。
    - 测试：已有的暴力对比测试在 `TRACK_STAMPS = true` 的实例上再跑一遍（不带时间戳的写入永不过期），确认行为不变。
 2. **`Filter queries by min_stamp`**：
-   - 内容：六个查询重载；在 `t_max < min_stamp` 的子树处剪枝，叶内逐点比较。
+   - 内容：`SearchOptions` 增加 `min_stamp`（条件基类，只在开启开关时存在）；在 `t_max < min_stamp` 的子树处剪枝，叶内逐点比较；开启开关时 `deletePoints` 删除最旧的一份。
    - 测试：带时间戳的暴力模型，随机插入、按点删除、box 删除后，对比带 `min_stamp` 的四类查询。
    - 先做只读的查询，后面两个提交的测试就能通过查询观察时间戳。
 3. **`Add touchPoints and expireBefore`**：
@@ -658,7 +701,7 @@ Phase 1 的惰性标记只有一种，即整树删除的 `tree_deleted`；v2 去
   - 构建、插入、四类查询的耗时，只报告。
 - **touch**：Part 2 中每帧 5-NN 查询之后，调用 `touchPoints(本帧查询返回的全部近邻, 帧号)`。
   - 报告每帧 touch 耗时（总计、最慢 1% 帧）、与同帧插入耗时之比，以及近邻去重后剩下的比例。
-  - 标准是 7.3 的“不超过同帧插入的 3 倍”（见 7.9 第 2 条）。
+  - 标准：每帧耗时的最慢 1% 平均不超过 5 ms，globalMap 和 sparse 都要满足；与同帧插入耗时之比只报告（7.9 第 2 条的决定）。
 - **expire**：新增 Part 4，帧与 Part 3 相同，但不做 box 删除，改为每 10 帧 `expireBefore(帧号 - W)`。
   - W 取使保留点数与 Part 3 相近的值，在 sparse 上先跑一次确定。
   - 报告 expire 总耗时和平均每删除一个点的耗时，与 Part 3 的 box 删除对比（7.3：处于同一量级）。
@@ -668,6 +711,8 @@ Phase 1 的惰性标记只有一种，即整树删除的 `tree_deleted`；v2 去
 
 ### 7.9 需要审阅方决定的问题
 
+以下各条已由用户在 2026-10-04 决定，见决定记录；正文已同步。保留原来的分析，供以后参考。
+
 1. **内存标准**：7.3 的“不超过 5 B/点”按每槽一个 `uint32_t` 的方案达不到。7.5 的估算是 5.4–6.0 B/点：时间戳按槽位分配，摊到每个点是 4 B ÷ 填充率（Phase 1 实测每叶 24–27 点，填充率 75–83%）；内部节点的 malloc 块还要从 80 B 变为 96 B。可选做法：
    - **(a) 标准改为 6.5 B/点**：按每槽 4 B、填充率不低于 70%，再加内部节点的增量估算。语义精确，实现最简单。执行方建议采用。
    - **(b) 叶内存 16 位的相对时间戳，每叶另存一个 32 位基准**，约 2.4–2.7 B/点。
@@ -676,6 +721,7 @@ Phase 1 的惰性标记只有一种，即整树删除的 `tree_deleted`；v2 去
      - 插入、分裂、重建都要处理基准的调整。
    - **(c) 只存叶子级时间戳**（7.2 的后备方案），约 0.6 B/点。粒度是整个叶子：touch 一个点，整个叶子一起续期。
    - 重排成员（把 `split`、`axis` 移进 `Node` 的对齐空隙）可以让 `Inner` 保持 72 B，增量降到 4.8–5.4 B/点。但这仍超过 5 B/点，而且会改变关闭开关时的布局，不建议。
+   - **决定**：采用 (a)，标准改为不超过 6.5 B/点。
 2. **touch 的耗时标准**：执行方用一个临时程序（没有进仓库）估算了 touch 的开销。
    - 做法：按 7.4 的语义查找每个点的全部拷贝，刷新所在的叶子和沿途的祖先，只是不写时间戳。
    - 流程：按 Part 2 的方式，每帧先做 5-NN 查询，再 touch 本帧查询返回的全部近邻，最后插入本帧。touch 前先等待重建结束，所以插入总走直接写入的路径。
@@ -692,13 +738,15 @@ Phase 1 的惰性标记只有一种，即整树删除的 `tree_deleted`；v2 去
      - 对排序后的整批点做一次共同下降，落在同一棵子树里的点一起走，减少重复的路径和 cache miss；
      - 由查询返回叶子和槽位的句柄，touch 按句柄直接更新，不再下降。句柄要在两次加锁之间保持有效，会改变并发协议，需要单独审阅。
    - 请审阅方决定 3 倍的标准是否保留。保留的话，大概率需要上面的共同下降。
-3. **`Stamp` 用独立类型还是直接用 `uint32_t`**：执行方建议独立类型，理由见 7.4。
-4. **开启开关时不带时间戳的写入**：执行方建议视为永不过期（7.4），这样已有测试可以原样复用。更严格的做法是开启时禁止不带时间戳的写入（编译错误），但已有测试就不能直接复用了。
-5. **有重复点时 `deletePoints` 删最旧的一份**（7.4）：开启开关时要看完所有包含该点的子树，比现在多一点开销，换来确定的语义。
+   - **决定**：标准改为绝对值，每帧耗时的最慢 1% 平均不超过 5 ms（两张地图）；先去重，不做共同下降和句柄；与插入之比只报告；叶子的 `[t_min, t_max]` 不变时可以不更新祖先。
+3. **`Stamp` 用独立类型还是直接用 `uint32_t`**：执行方建议独立类型，理由见 7.4。**决定**：独立类型。
+4. **开启开关时不带时间戳的写入**：执行方建议视为永不过期（7.4），这样已有测试可以原样复用。更严格的做法是开启时禁止不带时间戳的写入（编译错误），但已有测试就不能直接复用了。**决定**：永不过期，文档写明 `Stamp` 的最大值有这个含义。
+5. **有重复点时 `deletePoints` 删最旧的一份**（7.4）：开启开关时要看完所有包含该点的子树，比现在多一点开销，换来确定的语义。**决定**：开启时删最旧的一份，关闭时行为不变。
 6. **查询参数的形式**：7.4 给每个查询加一个带 `Stamp` 的重载，共六个。
    - 如果以后还要给 `radiusSearch` 加“不排序”选项，参数会继续增加。
    - 另一种做法是像 nanoflann 的 `SearchParameters` 那样，引入一个查询选项结构体（`max_dist`、`min_stamp`、`sorted`），一次把重载定下来。
    - 建议与“不排序”选项一起决定。
+   - **决定**：不加六个带 `Stamp` 的重载；`min_stamp` 作为 `SearchOptions`（5.11）的字段，只在开启开关时存在。
 
 ## 8. Phase 4：系统级验证（本轮不做，需要用户决定）
 
@@ -870,6 +918,23 @@ Phase 0 验收通过。上面四个问题的决定如下，已同步修改第 4 
 - **合并**：50 次运行合并后，中位数之比为 1.058，差异不显著（Mann–Whitney p = 0.24）。
 - 这一项在 globalMap 上测的是没有改动的代码路径。执行方判断为噪声，但按约定不自行判为通过，请用户决定。
 - 其余各项全部达标，详见结果记录。
+
+**2026-10-04，5.10 验收、不排序的 radiusSearch、Phase 3 的设计（用户转达的决定）**
+
+- **5.10**：globalMap Part 2 的最慢 1% 帧按噪声处理，判定通过，5.10 验收完成。占用一个核的 `chain` 进程是审阅方留下的，已经停掉。在干净的条件下把这一项重测一次（基线与新版交替各 10 次），结果补进结果记录；比值仍超过 1.10 时停下来报告。
+- **不排序的 radiusSearch**：作为 Phase 3 之前的单独一步，见 5.11。
+- **Phase 3 设计审阅通过，按第 7 节开工**。7.9 的决定如下，正文已同步：
+
+| 7.9 的问题 | 决定 |
+|---|---|
+| 1. 内存标准 | 改为不超过 6.5 B/点，采用方案 (a)，即每槽一个 `uint32_t` |
+| 2. touch 的耗时标准 | 改为绝对值：Part 2 每帧刷新该帧 5-NN 返回的全部近邻，每帧耗时的最慢 1% 平均不超过 5 ms，globalMap 和 sparse 都要满足。`touchPoints` 先对输入去重；不做共同下降，不做句柄。与同帧插入耗时之比只报告，不作标准。允许的小优化：叶子的 `[t_min, t_max]` 没有变化时，不必更新祖先 |
+| 3. `Stamp` 的类型 | 独立类型 |
+| 4. 开启开关时不带时间戳的写入 | 视为永不过期；文档写明 `Stamp` 的最大值有这个含义 |
+| 5. 有重复点时的 `deletePoints` | 开启开关时删最旧的一份；关闭时行为不变 |
+| 6. 查询参数的形式 | 不加六个带 `Stamp` 的查询重载。`min_stamp` 作为 `SearchOptions` 的字段，只在 `TRACK_STAMPS` 为真时存在，关闭开关时使用它是编译错误 |
+
+- **流程与之前相同**：按 7.7 的粒度提交，每次提交前跑单元测试、TSan、ASan + UBSan。关闭开关时，布局和性能必须与现在一致（7.3 第 2 项，按 5.7 的测法）。全部做完后按 7.3 逐项验收，实测数字写进结果记录，再报告。达不到标准或需要偏离设计时，停下来报告，不自行放宽。
 
 ### 结果记录
 
@@ -1237,3 +1302,21 @@ dense 上 likd-tree 的 `radiusSearch` 比 ikd-tree 慢一倍以上，基线也�
   - 地图 benchmark 上没有出现：sparse 的重建轮数只多 3%，globalMap 没有变化。
   - 如果要处理，一个折中是回放时每 2000 个操作才检查一次候选，与写调用的分块一致；代价是有序写入时，每块之内仍会长出约 2000 / 16 = 125 层的链。执行方没有改，按审阅方给定的修法执行。
 - **重复点同样会长链，修复对它也有效**：同一组单元测试中，`testDeleteDifferential`（网格化坐标，大量重复点）在叶子大小 2 上从 4.8 s 降到 1.0 s。
+
+**2026-10-04，5.10 的补测：干净条件下的 globalMap Part 2（执行方）**
+
+- 条件：`chain` 进程停掉之后，负载约 0.4。基线 `build/benchmark_phase1`（`93c1d4d`），新版从 `a2cb083` 重新编译（与验收时用的可执行文件逐字节相同），globalMap 交替各 10 次；原始输出在 `build/bench_runs/fix-ordered-clean/`。
+- **最慢 1% 帧：2.26 → 2.12 ms（0.938），在 1.10 之内。**
+
+| 项（Part 2） | 基线中位数 [最小, 最大] | 新版 | 新版 / 基线 |
+|---|---|---|---|
+| 插入总计 | 715.3 ms [682.0, 728.8] | 701.7 ms [690.1, 779.8] | 0.981 |
+| 最慢 1% 帧 | 2.26 ms [1.88, 3.81] | 2.12 ms [1.92, 3.86] | 0.938 |
+| 单帧最大 | 3.46 ms [2.51, 7.17] | 3.12 ms [2.79, 5.56] | 0.904 |
+| 1-NN 顺序 / 5-NN 顺序 / 5-NN TBB | 1189.8 / 1905.0 / 290.7 ms | 1182.6 / 1879.9 / 294.9 ms | 0.994 / 0.987 / 1.014 |
+| 重建轮数 | 688 | 688 | 1.000 |
+| 最多排队写入 | 2000 [0, 2000] | 2000 [0, 2000] | 1.000 |
+| 排队写入最长等待 | 6.21 ms [0, 9.74] | 5.01 ms [0, 9.75] | 0.807 |
+
+- 绝对耗时回到了 Phase 1 验收时的水平（插入总计约 700 ms，Phase 1 为 683 ms）。上一轮比这一轮高约 30%，来自 `chain` 进程。
+- 排队写入的最长等待约 5–6 ms，与关闭 Phase 2 时的依据一致。
