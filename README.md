@@ -154,6 +154,10 @@ size_t bytes = tree.memoryUsage();
   queued and applied in order right after, so a query may briefly not see
   them. Call `waitForRebuild()` (or pass `wait_for_rebuild = true`) when they
   must be visible.
+- Known limitation: the queue has no bound. Writes issued back to back, with
+  no pause between them, make it grow, and each write then takes longer to
+  become visible. Calling `waitForRebuild()` from time to time keeps both in
+  check.
 
 ### Custom Point Types
 

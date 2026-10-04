@@ -24,7 +24,9 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <string>
 #include <thread>
@@ -140,7 +142,18 @@ std::vector<float> ikdKnn(IkdTree& tree, const PointVector<PointType>& qs, int k
 struct Totals {
   double build = 0, insert = 0, insert_max = 0, nn = 0, knn = 0, knn_par = 0,
          del = 0;
+  std::vector<double> frame_inserts;  // insert time of each frame
 };
+
+// Mean of the slowest 1% of frame times (at least one frame): less noisy
+// than the single slowest frame
+double slowestPercentMean(std::vector<double> times) {
+  if (times.empty()) return NAN;
+  size_t n = std::max<size_t>(1, (times.size() + 99) / 100);
+  std::partial_sort(times.begin(), times.begin() + n, times.end(),
+                    std::greater<double>());
+  return std::accumulate(times.begin(), times.begin() + n, 0.0) / n;
+}
 
 void printRow(const char* name, double likd, double ikd,
               const char* unit = "ms") {
@@ -266,6 +279,8 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
     I.insert += elapsedMs(a1, a2);
     L.insert_max = std::max(L.insert_max, elapsedMs(a0, a1));
     I.insert_max = std::max(I.insert_max, elapsedMs(a1, a2));
+    L.frame_inserts.push_back(elapsedMs(a0, a1));
+    I.frame_inserts.push_back(elapsedMs(a1, a2));
 
     if (local_map_half > 0 && frames % 10 == 9) {
       std::vector<LikdTree::AABB> boxes = localMapBoxes(batch, local_map_half);
@@ -287,6 +302,8 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
   printRow("Build (first frame)", L.build, I.build);
   printRow("Insert total", L.insert, I.insert);
   printRow("Insert worst frame", L.insert_max, I.insert_max);
+  printRow("Insert slowest 1% (mean)", slowestPercentMean(L.frame_inserts),
+           slowestPercentMean(I.frame_inserts));
   printRow("1-NN query total (seq)", L.nn, I.nn);
   printRow("5-NN query total (seq)", L.knn, I.knn);
   printRow("5-NN query total (TBB)", L.knn_par, I.knn_par);
@@ -309,10 +326,10 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
 }
 
 // The same frames and box deletions as runStream, fed into one tree alone and
-// without queries.
-template <typename Build, typename Add, typename DeleteBoxes>
+// without queries. end_frame runs after each frame.
+template <typename Build, typename Add, typename DeleteBoxes, typename EndFrame>
 void feed(const PointVector<PointType>& pts, size_t frame, float local_map_half,
-          Build build, Add add, DeleteBoxes delete_boxes) {
+          Build build, Add add, DeleteBoxes delete_boxes, EndFrame end_frame) {
   build(PointVector<PointType>(pts.begin(), pts.begin() + frame));
   size_t frames = 0;
   for (size_t s = frame; s < pts.size(); s += frame, ++frames) {
@@ -321,11 +338,15 @@ void feed(const PointVector<PointType>& pts, size_t frame, float local_map_half,
     add(batch);
     if (local_map_half > 0 && frames % 10 == 9)
       delete_boxes(localMapBoxes(batch, local_map_half));
+    end_frame();
   }
 }
 
 // runStream interleaves the two trees, so their heap growth can't be told
 // apart there: feed each tree alone and divide by the points it still holds.
+// likd-tree waits for its rebuild after every frame. Frames fed back to back
+// would otherwise pile up behind a running rebuild, and the RSS would measure
+// that queue instead of the tree.
 void streamMemory(const PointVector<PointType>& pts, size_t frame,
                   float local_map_half) {
   double likd_heap, likd_rss, likd_usage, ikd_heap, ikd_rss;
@@ -336,8 +357,8 @@ void streamMemory(const PointVector<PointType>& pts, size_t frame,
     feed(pts, frame, local_map_half,
          [&](const PointVector<PointType>& f) { likd.build(f); },
          [&](const PointVector<PointType>& b) { likd.addPoints(b); },
-         [&](const std::vector<LikdTree::AABB>& boxes) { likd.deleteBoxes(boxes); });
-    likd.waitForRebuild();
+         [&](const std::vector<LikdTree::AABB>& boxes) { likd.deleteBoxes(boxes); },
+         [&] { likd.waitForRebuild(); });
     MemorySample after = MemorySample::now();
     int valid = likd.size();
     likd_heap = perPoint(before.heap, after.heap, valid);
@@ -354,7 +375,8 @@ void streamMemory(const PointVector<PointType>& pts, size_t frame,
          [&](const std::vector<LikdTree::AABB>& boxes) {
            std::vector<BoxPointType> b = toIkdBoxes(boxes);
            ikd->Delete_Point_Boxes(b);
-         });
+         },
+         [] {});
     // ikd-Tree has no call that waits for its rebuild thread
     std::this_thread::sleep_for(std::chrono::seconds(1));
     MemorySample after = MemorySample::now();
