@@ -9,6 +9,11 @@
 // Memory is the heap growth (glibc mallinfo, all arenas) while one tree is
 // built or fed alone, divided by the points it holds. RSS growth is printed
 // next to it because the heap figure leaves out fragmentation.
+//
+// Compile-time switches for sweeps:
+//   -DLIKD_BENCH_LEAF_SIZE=N   likd-tree leaf size (default: the library's)
+//   -DLIKD_BENCH_XYZINORMAL    pcl::PointXYZINormal (48 bytes) instead of
+//                              pcl::PointXYZ
 
 // Enable TBB parallel execution and rebuild statistics (define before
 // including likd_tree.hpp)
@@ -47,8 +52,19 @@
 #endif
 #endif
 
+#ifdef LIKD_BENCH_XYZINORMAL
+using PointType = pcl::PointXYZINormal;
+#else
 using PointType = pcl::PointXYZ;
+#endif
+#ifdef LIKD_BENCH_LEAF_SIZE
+struct BenchOptions : DefaultOptions {
+  static constexpr int LEAF_SIZE = LIKD_BENCH_LEAF_SIZE;
+};
+using LikdTree = KDTree<PointType, PointTraits<PointType>, BenchOptions>;
+#else
 using LikdTree = KDTree<PointType>;
+#endif
 using IkdTree = KD_TREE<PointType>;
 using Clock = std::chrono::steady_clock;
 
