@@ -189,6 +189,125 @@ void testBoxSearch() {
   CHECK(res.empty());
 }
 
+// Coordinates snapped to a 0.5 grid: many points tie on the split axes.
+Points gridBlob(std::mt19937& rng, size_t n) {
+  Points pts = blob(rng, n, 4.0f);
+  for (auto& p : pts) {
+    p = {std::round(p.x * 2) / 2, std::round(p.y * 2) / 2,
+         std::round(p.z * 2) / 2};
+  }
+  return pts;
+}
+
+bool sameAsModel(const Tree& tree, const Points& model, std::mt19937& rng) {
+  if (tree.size() != static_cast<int>(model.size())) return false;
+  std::uniform_real_distribution<float> u(-60.0f, 60.0f);
+  for (int i = 0; i < 30; ++i) {
+    Pt q{u(rng), u(rng), u(rng)};
+    int k = 1 + i % 8;
+    Points res;
+    std::vector<float> d;
+    tree.knnSearch(q, k, res, d);
+    if (!sameDistances(d, bruteKnn(model, q, k))) return false;
+    auto [nearest, nd] = tree.nearestNeighbors(q);
+    if (model.empty() ? nearest.has_value()
+                      : std::fabs(nd - bruteNearest(model, q)) > 1e-4f)
+      return false;
+    tree.radiusSearch(q, 8.0f, res, d);
+    size_t in_radius = 0;
+    for (const auto& p : model) in_radius += dist(p, q) <= 8.0f;
+    if (res.size() != in_radius) return false;
+    Tree::AABB box({q.x - 6, q.y - 6, q.z - 6}, {q.x + 6, q.y + 6, q.z + 6});
+    tree.boxSearch(box, res);
+    size_t in_box = std::count_if(model.begin(), model.end(),
+                                  [&](const Pt& p) { return box.contains(p); });
+    if (res.size() != in_box) return false;
+  }
+  return true;
+}
+
+// Random inserts, point deletes and box deletes against a brute-force model.
+// Without wait_for_rebuild, many writes land in the queue of a running rebuild.
+void testDeleteDifferential() {
+  std::printf("[delete: differential]\n");
+  std::mt19937 rng(9);
+  std::uniform_real_distribution<float> u(-50.0f, 50.0f);
+  Tree tree;
+  Points model = gridBlob(rng, 3000);
+  tree.build(model);
+  for (int round = 0; round < 600; ++round) {
+    int kind = rng() % 10;
+    if (kind < 5) {
+      Points b = gridBlob(rng, 200 + rng() % 800);
+      tree.addPoints(b);
+      model.insert(model.end(), b.begin(), b.end());
+    } else if (kind < 8) {
+      Points del;
+      for (int i = 0; i < 300 && !model.empty(); ++i)
+        del.push_back(model[rng() % model.size()]);
+      del.push_back({1000.0f, 1000.0f, 1000.0f});  // absent: no-op
+      tree.deletePoints(del);
+      for (const auto& p : del) {
+        auto it = std::find_if(model.begin(), model.end(), [&](const Pt& m) {
+          return m.x == p.x && m.y == p.y && m.z == p.z;
+        });
+        if (it != model.end()) {
+          *it = model.back();
+          model.pop_back();
+        }
+      }
+    } else {
+      float cx = u(rng), cy = u(rng), h = 2.0f + rng() % 15;
+      Tree::AABB box({cx - h, cy - h, -100.0f}, {cx + h, cy + h, 100.0f});
+      tree.deleteBox(box);
+      model.erase(std::remove_if(model.begin(), model.end(),
+                                 [&](const Pt& p) { return box.contains(p); }),
+                  model.end());
+    }
+    if (round % 6 == 5) {
+      tree.waitForRebuild();
+      CHECK(sameAsModel(tree, model, rng));
+    }
+  }
+  tree.waitForRebuild();
+  CHECK(sameAsModel(tree, model, rng));
+  // Rebuilds reclaim deleted nodes
+  CHECK(tree.nodeCount() <= 2 * tree.size() + 64);
+}
+
+// Every point deleted once by value, with many ties on split values.
+void testDeleteTies() {
+  std::printf("[delete: tied coordinates]\n");
+  std::mt19937 rng(10);
+  Points pts = gridBlob(rng, 20000);
+  Tree tree;
+  tree.build(pts);
+  tree.deletePoints(pts, true);
+  CHECK(tree.size() == 0);
+  CHECK(!tree.nearestNeighbors(Pt{0, 0, 0}).first);
+}
+
+void testDeleteAll() {
+  std::printf("[delete: everything, then reuse]\n");
+  std::mt19937 rng(11);
+  Tree tree;
+  tree.build(blob(rng, 5000));
+  tree.deleteBox(Tree::AABB({-1e9f, -1e9f, -1e9f}, {1e9f, 1e9f, 1e9f}), true);
+  CHECK(tree.size() == 0);
+  CHECK(tree.nodeCount() == 0);
+  CHECK(!tree.nearestNeighbors(Pt{0, 0, 0}).first);
+  Points res, queries(3, Pt{0, 0, 0});
+  std::vector<float> d;
+  tree.knnSearch(Pt{0, 0, 0}, 5, res, d);
+  CHECK(res.empty());
+  tree.nearestNeighbors(queries, res, d);
+  CHECK(d.size() == 3 && std::isinf(d[0]));
+  Points again = blob(rng, 1000);
+  tree.addPoints(again, true);
+  CHECK(tree.size() == 1000);
+  CHECK(matchesBruteForce(tree, again, rng, 50));
+}
+
 // Batches that arrive while the worker drains the pending buffer used to be
 // stranded there once the rebuild flag flipped back.
 void testNoPointsLostDuringRebuild() {
@@ -285,10 +404,18 @@ void testReadersDuringWritesAndBuild() {
     });
   }
   Points last;
+  std::uniform_real_distribution<float> u(-50.0f, 50.0f);
   for (int i = 0; i < 200; ++i) {
     if (i % 50 == 49) {
       last = blob(rng, 3000);
       tree.build(last);
+    } else if (i % 7 == 6) {
+      float cx = u(rng), cy = u(rng);
+      Tree::AABB box({cx - 10, cy - 10, -100}, {cx + 10, cy + 10, 100});
+      tree.deleteBox(box);
+      last.erase(std::remove_if(last.begin(), last.end(),
+                                [&](const Pt& p) { return box.contains(p); }),
+                 last.end());
     } else {
       Points b = blob(rng, 1000, 1.0f);
       tree.addPoints(b);
@@ -310,6 +437,9 @@ int main() {
   testIncrementalQueries();
   testKnnSearch();
   testBoxSearch();
+  testDeleteDifferential();
+  testDeleteTies();
+  testDeleteAll();
   testNoPointsLostDuringRebuild();
   testWaitForRebuild();
   testNearestIsCopy();
