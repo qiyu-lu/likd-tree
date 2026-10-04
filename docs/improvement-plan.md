@@ -1,6 +1,6 @@
 # likd-tree 改进计划
 
-- 状态：v2，已审阅。Phase 0、Phase 1 已完成并验收；Phase 2 已关闭；5.10 的修复已完成，验收中有一项需要用户决定（见决定记录），待审；审阅通过后再开工 Phase 3
+- 状态：v2，已审阅。Phase 0、Phase 1 已完成并验收；Phase 2 已关闭；5.10 的修复已完成，验收中有一项需要用户决定（见决定记录）；第 7 节已按 Phase 1 的实际结构补全；两者待审，审阅通过后再开工 Phase 3
 - 日期：2026-10-04
 - 分支：`improvements`（基于 `main` @ `6443087`）
 - 分工：执行方为 Claude（编写 v1 的会话），审阅方为另一个 Claude 会话
@@ -454,7 +454,7 @@ class KDTree {
 
 - **开关 `Options::TRACK_STAMPS`**，默认 `false`。关闭时，`sizeof` 和性能与 Phase 1 完全一致，用条件基类加空基类优化实现。
 - **时间戳存在库内，类型为 `uint32_t`**。`uint16_t` 按 10 Hz 帧号不到两小时就回绕，回绕后 `[t_min, t_max]` 的比较全部失效。PCL 点类型的第 4 个 float 是填充，可以零成本放时间戳，但取出的点会带着非 1.0 的 `data[3]`，不适合做默认行为，留作以后的可选优化。
-- **开启时的额外存储**：
+- **开启时的额外存储**（按 Phase 1 实测的填充率重新估算，见 7.5）：
   - 叶子增加 `uint32_t stamps[LeafSize]`，每点多 4 B；
   - 每个节点增加子树的 `[t_min, t_max]`，每节点多 8 B，摊到每点约 0.7 B。
 - **`Op` 日志**增加时间戳字段，以及 touch 和 expire 两种操作；重建期间照常排队，按顺序回放。
@@ -475,11 +475,230 @@ class KDTree {
 - **正确性**：建立带时间戳的暴力参考模型；随机混合执行 add / touch / expire / delete 后，对比所有查询结果和 `size()`。`validate()` 增加对 `[t_min, t_max]` 的检查。
 - **关闭开关时**：benchmark 结果与 Phase 1 的差异在噪声范围内（±5%）。
 - **开启开关时**：
-  - 内存增量不超过 5 B/点；
+  - 内存增量不超过 5 B/点（按现在的布局达不到，见 7.9 第 1 条）；
   - 在流式地图上，`expireBefore` 与同等删除量的 box 删除耗时处于同一量级；
-  - `touchPoints`：benchmark 每帧刷新该帧 5-NN 查询返回的全部近邻，每帧耗时不超过同帧插入耗时的 3 倍。
+  - `touchPoints`：benchmark 每帧刷新该帧 5-NN 查询返回的全部近邻，每帧耗时不超过同帧插入耗时的 3 倍（估算略超，见 7.9 第 2 条）。
 
-Phase 3 开工前，执行方按 Phase 1 的实际结构把本节补全（接口签名、`Op` 的布局、提交拆分），再审一次。
+Phase 3 开工前，执行方按 Phase 1 的实际结构把本节补全（接口签名、`Op` 的布局、提交拆分），再审一次。补全的内容见 7.4–7.9（执行方，2026-10-04），其中 7.9 列出需要审阅方决定的问题。
+
+### 7.4 接口签名
+
+开关和时间戳类型：
+
+```cpp
+struct DefaultOptions {
+  static constexpr int LEAF_SIZE = 32;
+  // Keep a stamp per point. Off: layout and speed as without the option.
+  static constexpr bool TRACK_STAMPS = false;
+};
+
+template <typename PointType, typename Traits, typename Options>
+class KDTree {
+ public:
+  // A frame number or a time, in any unit that never decreases or wraps
+  struct Stamp {
+    uint32_t value = 0;
+  };
+  ...
+};
+```
+
+- **`Stamp` 是独立类型，不直接用 `uint32_t`**。`addPoints(pts, wait_for_rebuild)` 的第二个参数是 `bool`。如果时间戳是整数，`addPoints(pts, frame)` 在 `frame` 为 `int` 时与 `bool` 重载二义，`frame` 为 `bool` 时会静默选中不带时间戳的重载。独立类型让两者在编译期分开。
+- **嵌套在 `KDTree` 里**，与 `AABB` 一致，不往全局命名空间里加 `Stamp` 这样的通用名字。
+
+只在 `TRACK_STAMPS` 为真时存在的写接口（成员模板加 `std::enable_if_t`，关闭开关时调用是编译错误）：
+
+```cpp
+  void build(const PointVector<PointType>& pts, Stamp stamp);
+  void addPoints(const PointVector<PointType>& pts, Stamp stamp,
+                 bool wait_for_rebuild = false);
+  // Raises the stamp of every stored copy of each point (exact coordinates)
+  // to `stamp`; copies with a newer stamp keep it.
+  void touchPoints(const PointVector<PointType>& pts, Stamp stamp,
+                   bool wait_for_rebuild = false);
+  // Deletes every point whose stamp is older than `stamp`.
+  void expireBefore(Stamp stamp, bool wait_for_rebuild = false);
+```
+
+带 `min_stamp` 的查询，同样只在开启时存在。时间戳早于 `min_stamp` 的点视为不存在：
+
+```cpp
+  std::pair<std::optional<PointType>, float> nearestNeighbors(
+      const PointType& query, Stamp min_stamp) const;
+  void nearestNeighbors(const PointVector<PointType>& queries,
+                        PointVector<PointType>& results,
+                        std::vector<float>& distances, Stamp min_stamp) const;
+  void radiusSearch(const PointType& query, float radius,
+                    PointVector<PointType>& results,
+                    std::vector<float>& distances, Stamp min_stamp) const;
+  void knnSearch(const PointType& query, int k, PointVector<PointType>& results,
+                 std::vector<float>& distances, float max_dist,
+                 Stamp min_stamp) const;
+  void knnSearch(const PointVector<PointType>& queries, int k,
+                 std::vector<PointVector<PointType>>& results,
+                 std::vector<std::vector<float>>& distances, float max_dist,
+                 Stamp min_stamp) const;
+  void boxSearch(const AABB& box, PointVector<PointType>& results,
+                 Stamp min_stamp) const;
+```
+
+已有接口在开启开关时的语义：
+
+- **不带时间戳的 `build(pts)` 和 `addPoints(pts, wait)`**：点的时间戳取 `Stamp` 的最大值，永不过期，对应 Redis 中没有设置 TTL 的键。这样已有的全部单元测试可以原样在开启开关的实例上运行。
+- **`deletePoints`**：开启时删除时间戳最旧的那份拷贝；关闭时照旧删除先找到的一份。有重复点时，删掉哪一份会影响以后的过期，规定为最旧的一份，暴力模型才能精确对照。
+- **不带 `min_stamp` 的查询**行为不变。`size()` 仍是未删除的点数，与时间戳无关。
+
+内部的查询函数和 `collect` 增加 `uint32_t min_stamp` 参数。关闭开关时它恒为 0，相关判断用 `if constexpr` 去掉。
+
+### 7.5 数据布局
+
+节点与叶子。`TRACK_STAMPS` 为假时，空基类经空基类优化不占空间，布局与 Phase 1 逐字节相同：
+
+```cpp
+struct NoStampBounds {};
+struct StampBounds {  // stamps of the non-deleted points below; [max, 0] if none
+  uint32_t t_min = UINT32_MAX;
+  uint32_t t_max = 0;
+};
+struct Node : std::conditional_t<TRACK_STAMPS, StampBounds, NoStampBounds> {
+  ...  // the Phase 1 fields, unchanged
+};
+struct Inner : Node { ... };                                     // unchanged
+struct Leaf : Node { Mask deleted; PointType pts[LeafSize]; };  // unchanged
+struct StampedLeaf : Leaf {  // the leaf allocated with TRACK_STAMPS
+  uint32_t stamps[LeafSize];  // stamps[i] belongs to pts[i]
+};
+```
+
+- **时间戳数组放在 `pts` 之后**（派生类 `StampedLeaf`），叶子头、`deleted` 和 `pts` 的偏移与 Phase 1 相同，不带 `min_stamp` 的查询不会多读一条 cache line。若放进基类，它会插在 `deleted` 和 `pts` 之间。
+- **开启时按 `StampedLeaf` 分配和释放**。`destroy` 按真实类型 `delete`，与 5.2 的要求一致。
+- **多个空基类用不同的类型**，否则同类型的两个空子对象不能共用地址，空基类优化会失效。
+
+`pcl::PointXYZ`、`LeafSize = 32` 时的大小：
+
+| | Phase 1 | 开启 `TRACK_STAMPS` |
+|---|---|---|
+| `Node` | 48 B | 56 B |
+| `Inner` | 72 B（malloc 块 80 B） | 80 B（块 96 B） |
+| `Leaf` | 576 B（块 592 B） | 704 B（块 720 B；`Node` 增加的 8 B 落在 `pts` 前原有的对齐空隙里） |
+
+按 Phase 1 实测的结构估算堆内存增量。`memoryUsage()` 约为 648 B × 叶子数（每个叶子 576 B，加上数量相近的内部节点 72 B），由每点的 `memoryUsage()` 反推每叶点数 p；增量约为 (128 + 16) / p：
+
+| 场景（取自 `phase1-final`） | 每点 `memoryUsage()` | 每叶点数 p | 堆增量估算 |
+|---|---|---|---|
+| Part 1 建树，两张地图 | 24.31 B | 26.7 | 5.4 B/点 |
+| Part 2 流式，globalMap | 27.06 B | 23.9 | 6.0 B/点 |
+| Part 2 流式，sparse | 24.57 B | 26.4 | 5.5 B/点 |
+| Part 3，globalMap / sparse | 25.07 / 24.92 B | 25.8 / 26.0 | 5.6 / 5.5 B/点 |
+
+7.2 的估算是“每点 4 B 加每点约 0.7 B”，没有计入叶子填充率：时间戳按槽位分配，摊到每个点是 4 B ÷ 填充率。由此 7.3 的“不超过 5 B/点”按现在的布局达不到，见 7.9 第 1 条。
+
+`Op` 的布局：
+
+```cpp
+enum class OpType : uint8_t { kInsert, kDeletePoint, kDeleteBox, kTouch, kExpire };
+struct NoOpStamp {};
+struct OpStamp {
+  uint32_t stamp;  // insert, touch: the stamp; expire: the cutoff
+};
+struct Op : std::conditional_t<TRACK_STAMPS, OpStamp, NoOpStamp> {
+  OpType type;
+  PointType point;  // insert, delete point, touch
+  AABB box;         // delete box
+};
+```
+
+- 关闭开关时 `Op` 的大小不变：`pcl::PointXYZ` 64 B，三个 float 的点 40 B。
+- 开启时 `pcl::PointXYZ` 仍是 64 B（时间戳和类型落在点之前的对齐空隙里），三个 float 的点变为 44 B。
+- `point` 和 `box` 不合并成 union：队列不是内存的主要部分。
+
+重建与分裂时携带时间戳：
+
+- 开启时，`collect` 和 `buildRecursive` 操作 `struct Stamped { PointType pt; uint32_t stamp; }` 数组（`pcl::PointXYZ` 时每项 32 B），`nth_element` 连同时间戳一起移动。关闭时仍操作 `PointVector<PointType>`，代码路径不变。
+- `makeRoom` 的压缩和分裂同理。
+
+### 7.6 惰性标记与时间戳的交互
+
+Phase 1 的惰性标记只有一种，即整树删除的 `tree_deleted`；v2 去掉了 `touchBox`，刷新没有惰性形式。规则如下：
+
+1. **`[t_min, t_max]` 与 `aabb` 同语义**：只覆盖未删除的点，`valid == 0` 时为空区间 `[max, 0]`。`updateLeaf`、`updateInner`、`killSubtree` 在更新 `aabb` 的同一处更新它。
+2. **惰性删除标记之下的时间戳是陈旧的，但不会被读到**：
+   - 查询、`touchPoints`、`deletePoints`、`expireBefore` 和 `collect` 都在 `valid == 0` 处停下，到不了标记之下；
+   - 插入在下降前照旧 `pushDown`，下推时 `killSubtree` 把子节点的 `[t_min, t_max]` 连同 `aabb` 一起置空；
+   - `validate()` 对带标记的子树只检查标记节点自身（`valid == 0`，包围盒和时间戳范围都为空），与 5.6 的规则一致。
+3. **`expireBefore` 复用同一个标记，不新增标记类型**：`t_max < T` 的子树直接 `killSubtree`（内部节点打标记，叶子把所有槽置删除位），O(1)；之后照常 `markIfUnbalanced`。删除比例超过一半的子树由重建回收，与 box 删除完全相同。
+4. **touch 只会提高时间戳**：
+   - 叶内改完后 `updateLeaf` 重算；被刷新的点若恰好是最小值，`t_min` 会上升。
+   - 祖先沿递归路径 `updateInner`，O(深度)，与按点删除相同。
+5. **重建收集时带着时间戳**：worker 无锁读取旧子树的时间戳，依据与 5.3 的不变量 3 相同（重建期间的写入都进队列）。
+6. **队列的顺序决定语义**：touch 和 expire 在重建期间照常排队，按调用顺序回放；5.10 的分块与回放中断对它们同样适用。例如，先排队的 touch 能让点躲过随后排队的 expire，顺序反过来就不能。这类顺序由 7.3 的差分测试覆盖，测试中写操作不等待重建，大量操作会经过队列。
+7. **失衡判据不变**：时间戳不影响平衡，expire 只通过删除比例影响重建。
+
+### 7.7 提交拆分
+
+1. **`Add a TRACK_STAMPS option`**：
+   - 内容：`Options::TRACK_STAMPS`、`Stamp`、条件基类、`StampedLeaf`、带时间戳的 `build` 和 `addPoints`、`Op` 的时间戳字段；分裂、压缩、重建都携带时间戳；`validate()` 检查 `[t_min, t_max]`。
+   - 测试：已有的暴力对比测试在 `TRACK_STAMPS = true` 的实例上再跑一遍（不带时间戳的写入永不过期），确认行为不变。
+2. **`Filter queries by min_stamp`**：
+   - 内容：六个查询重载；在 `t_max < min_stamp` 的子树处剪枝，叶内逐点比较。
+   - 测试：带时间戳的暴力模型，随机插入、按点删除、box 删除后，对比带 `min_stamp` 的四类查询。
+   - 先做只读的查询，后面两个提交的测试就能通过查询观察时间戳。
+3. **`Add touchPoints and expireBefore`**：
+   - 内容：两种新的 `Op`、写路径、回放。
+   - 测试：完整的暴力参考模型。插入、touch、expire、按点删除、box 删除随机混合，不等待重建；对比查询结果和 `size()`，每次写操作并等待重建后调用 `validate()`。
+4. **`Benchmark stamps, touch and expire`**：见 7.8。
+5. **README**。
+
+### 7.8 benchmark 方案
+
+- **开关**：编译选项 `-DLIKD_BENCH_STAMPS`，likd-tree 改用开启 `TRACK_STAMPS` 的实例，做法与 `LIKD_BENCH_LEAF_SIZE` 相同。时间戳取帧号，Part 1 的建树用 0。
+- **关闭开关时**（7.3 第 2 项）：默认编译的 benchmark 与 5.10 修复后的版本交替各 10 次，两张地图，5.7 的各项回退不超过 5%。
+- **开启开关本身的代价**：同一份代码，开关打开与关闭交替对比，不使用 touch、expire 和 `min_stamp`。
+  - Part 1/2/3 的堆内存增量，对照 7.3 第 3 项（标准见 7.9 第 1 条）；
+  - 构建、插入、四类查询的耗时，只报告。
+- **touch**：Part 2 中每帧 5-NN 查询之后，调用 `touchPoints(本帧查询返回的全部近邻, 帧号)`。
+  - 报告每帧 touch 耗时（总计、最慢 1% 帧）、与同帧插入耗时之比，以及近邻去重后剩下的比例。
+  - 标准是 7.3 的“不超过同帧插入的 3 倍”（见 7.9 第 2 条）。
+- **expire**：新增 Part 4，帧与 Part 3 相同，但不做 box 删除，改为每 10 帧 `expireBefore(帧号 - W)`。
+  - W 取使保留点数与 Part 3 相近的值，在 sparse 上先跑一次确定。
+  - 报告 expire 总耗时和平均每删除一个点的耗时，与 Part 3 的 box 删除对比（7.3：处于同一量级）。
+  - 以 sparse 为准，理由与 5.7 相同。
+- **`min_stamp` 查询**：Part 4 中另跑一组 `min_stamp = 帧号 - W / 2` 的 5-NN，报告耗时，以及结果与不带 `min_stamp` 时不同的比例。
+- ikd-tree 没有对应功能，这几项只报告 likd-tree。
+
+### 7.9 需要审阅方决定的问题
+
+1. **内存标准**：7.3 的“不超过 5 B/点”按每槽一个 `uint32_t` 的方案达不到。7.5 的估算是 5.4–6.0 B/点：时间戳按槽位分配，摊到每个点是 4 B ÷ 填充率（Phase 1 实测每叶 24–27 点，填充率 75–83%）；内部节点的 malloc 块还要从 80 B 变为 96 B。可选做法：
+   - **(a) 标准改为 6.5 B/点**：按每槽 4 B、填充率不低于 70%，再加内部节点的增量估算。语义精确，实现最简单。执行方建议采用。
+   - **(b) 叶内存 16 位的相对时间戳，每叶另存一个 32 位基准**，约 2.4–2.7 B/点。
+     - 约束：同一叶子里未删除点的时间戳跨度不能超过 65535 个单位。按 10 Hz 帧号约 1.8 小时，以毫秒为单位只有 65 秒。
+     - 超出时只能把最旧的时间戳抬高，等于推迟它们的过期。
+     - 插入、分裂、重建都要处理基准的调整。
+   - **(c) 只存叶子级时间戳**（7.2 的后备方案），约 0.6 B/点。粒度是整个叶子：touch 一个点，整个叶子一起续期。
+   - 重排成员（把 `split`、`axis` 移进 `Node` 的对齐空隙）可以让 `Inner` 保持 72 B，增量降到 4.8–5.4 B/点。但这仍超过 5 B/点，而且会改变关闭开关时的布局，不建议。
+2. **touch 的耗时标准**：执行方用一个临时程序（没有进仓库）估算了 touch 的开销。
+   - 做法：按 7.4 的语义查找每个点的全部拷贝，刷新所在的叶子和沿途的祖先，只是不写时间戳。
+   - 流程：按 Part 2 的方式，每帧先做 5-NN 查询，再 touch 本帧查询返回的全部近邻，最后插入本帧。touch 前先等待重建结束，所以插入总走直接写入的路径。
+   - 结果（与 5.10 修复后的库一起编译，单次运行）：
+
+     | 地图 | 每帧近邻数 | 去重后剩下 | touch 全部 / 插入 | 先去重再 touch / 插入 |
+     |---|---|---|---|---|
+     | globalMap | 9993 | 87.6% | 3.47 倍（每帧之比的中位数 3.56） | 3.53 倍 |
+     | sparse | 9988 | 3.8% | 3.34 倍（3.36） | 0.93 倍 |
+
+   - 逐点下降的 touch 约为插入的 3.3–3.5 倍，略超过 3 倍的标准。
+   - 去重的效果取决于近邻的重复程度。sparse 的一帧集中在约 31 m 内，近邻高度重复；globalMap 的一帧散布全图，几乎不重复。两张图都不是真实的扫描序列，真实的 LIO 扫描每帧都覆盖已建好的区域，重复程度介于两者之间。
+   - 执行方的计划：`touchPoints` 从一开始就先对输入去重（排序加 unique）。如果仍超过 3 倍，按代价从小到大再考虑：
+     - 对排序后的整批点做一次共同下降，落在同一棵子树里的点一起走，减少重复的路径和 cache miss；
+     - 由查询返回叶子和槽位的句柄，touch 按句柄直接更新，不再下降。句柄要在两次加锁之间保持有效，会改变并发协议，需要单独审阅。
+   - 请审阅方决定 3 倍的标准是否保留。保留的话，大概率需要上面的共同下降。
+3. **`Stamp` 用独立类型还是直接用 `uint32_t`**：执行方建议独立类型，理由见 7.4。
+4. **开启开关时不带时间戳的写入**：执行方建议视为永不过期（7.4），这样已有测试可以原样复用。更严格的做法是开启时禁止不带时间戳的写入（编译错误），但已有测试就不能直接复用了。
+5. **有重复点时 `deletePoints` 删最旧的一份**（7.4）：开启开关时要看完所有包含该点的子树，比现在多一点开销，换来确定的语义。
+6. **查询参数的形式**：7.4 给每个查询加一个带 `Stamp` 的重载，共六个。
+   - 如果以后还要给 `radiusSearch` 加“不排序”选项，参数会继续增加。
+   - 另一种做法是像 nanoflann 的 `SearchParameters` 那样，引入一个查询选项结构体（`max_dist`、`min_stamp`、`sorted`），一次把重载定下来。
+   - 建议与“不排序”选项一起决定。
 
 ## 8. Phase 4：系统级验证（本轮不做，需要用户决定）
 
@@ -509,7 +728,7 @@ v1 在这里列了 7 个请审阅方判断的问题，结论如下，细节已�
 
 ## 10. 执行流程与记录
 
-- **分支与提交**：在 `improvements` 分支上工作，按 5.9 的粒度提交，不推送到远端。Phase 0 和 Phase 1 已审阅通过，Phase 2 已关闭；5.10 的修复待审；Phase 3 开工前要再审。
+- **分支与提交**：在 `improvements` 分支上工作，按 5.9 的粒度提交，不推送到远端。Phase 0 和 Phase 1 已审阅通过，Phase 2 已关闭；5.10 的修复和第 7 节的补全待审；Phase 3 开工前要再审。
 - **单元测试**：每次提交前运行：
   ```bash
   cmake -B build && cmake --build build && (cd build && ctest --output-on-failure)
