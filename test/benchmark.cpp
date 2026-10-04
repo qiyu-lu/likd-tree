@@ -37,6 +37,14 @@
 #include <malloc.h>
 #endif
 
+// Optional reference: static nanoflann trees over the same points
+#ifdef LIKD_BENCH_NANOFLANN
+#include <nanoflann.hpp>
+#if NANOFLANN_VERSION < 0x150
+#error "The nanoflann reference needs nanoflann 1.5.0 or newer"
+#endif
+#endif
+
 using PointType = pcl::PointXYZ;
 using LikdTree = KDTree<PointType>;
 using IkdTree = KD_TREE<PointType>;
@@ -360,6 +368,68 @@ void streamMemory(const PointVector<PointType>& pts, size_t frame,
   printLikd("memoryUsage() per valid pt", likd_usage, "B/pt");
 }
 
+#ifdef LIKD_BENCH_NANOFLANN
+// What leaf buckets and pooled nodes give a static tree, which supports no
+// insertion or deletion. nanoflann indexes points the caller keeps.
+struct NanoflannCloud {
+  const PointVector<PointType>& pts;
+  size_t kdtree_get_point_count() const { return pts.size(); }
+  float kdtree_get_pt(size_t i, size_t dim) const {
+    const PointType& p = pts[i];
+    return dim == 0 ? p.x : (dim == 1 ? p.y : p.z);
+  }
+  template <class BBox>
+  bool kdtree_get_bbox(BBox&) const {
+    return false;
+  }
+};
+using NanoflannTree = nanoflann::KDTreeSingleIndexAdaptor<
+    nanoflann::L2_Simple_Adaptor<float, NanoflannCloud, float, uint32_t>,
+    NanoflannCloud, 3, uint32_t>;
+
+void nanoflannReference(const PointVector<PointType>& pts,
+                        const PointVector<PointType>& queries,
+                        const PointVector<PointType>& range_queries,
+                        float radius) {
+  NanoflannCloud cloud{pts};
+  for (size_t leaf : {10, 32}) {
+    releaseFreeMemory();
+    MemorySample m0 = MemorySample::now();
+    auto t0 = Clock::now();
+    NanoflannTree tree(3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(leaf));
+    auto t1 = Clock::now();
+    MemorySample m1 = MemorySample::now();
+    auto knn = [&](size_t k) {
+      std::vector<uint32_t> idx(k);
+      std::vector<float> d2(k);
+      for (const auto& q : queries) {
+        const float qv[3] = {q.x, q.y, q.z};
+        nanoflann::KNNResultSet<float, uint32_t> found(k);
+        found.init(idx.data(), d2.data());
+        tree.findNeighbors(found, qv);
+      }
+    };
+    auto q0 = Clock::now();
+    knn(1);
+    auto q1 = Clock::now();
+    knn(K);
+    auto q2 = Clock::now();
+    std::vector<nanoflann::ResultItem<uint32_t, float>> matches;
+    for (const auto& q : range_queries) {
+      const float qv[3] = {q.x, q.y, q.z};
+      tree.radiusSearch(qv, radius * radius, matches);
+    }
+    auto q3 = Clock::now();
+    printf("  nanoflann static, leaf %2zu: build %.2f ms, 1-NN x200k %.2f ms, "
+           "5-NN x200k %.2f ms, radius x20k %.2f ms, heap %.2f B/pt\n",
+           leaf, elapsedMs(t0, t1), elapsedMs(q0, q1), elapsedMs(q1, q2),
+           elapsedMs(q2, q3), perPoint(m0.heap, m1.heap, pts.size()));
+  }
+  printf("  (nanoflann heap excludes the %zu B/pt of points it indexes)\n",
+         sizeof(PointType));
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -483,6 +553,9 @@ int main(int argc, char** argv) {
     printRow("RSS growth per point", perPoint(m0.rss, m1.rss, n),
              perPoint(m2.rss, m3.rss, n), "B/pt");
     printLikd("memoryUsage() per point", double(likd.memoryUsage()) / n, "B/pt");
+#ifdef LIKD_BENCH_NANOFLANN
+    nanoflannReference(pts, queries, range_queries, radius);
+#endif
     delete ikd;
   }
 

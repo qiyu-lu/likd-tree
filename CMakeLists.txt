@@ -143,6 +143,13 @@ if(BUILD_BENCHMARK)
   )
   target_include_directories(benchmark PRIVATE thirdparty/ikd-Tree/ikd-Tree)
   target_link_libraries(benchmark kdtree ${LIKD_TREE_PCL_LIBRARIES} Threads::Threads)
+
+  # Optional static nanoflann (>= 1.5.0) reference in Part 1
+  set(NANOFLANN_INCLUDE_DIR "" CACHE PATH "Directory containing nanoflann.hpp")
+  if(NANOFLANN_INCLUDE_DIR)
+    target_include_directories(benchmark PRIVATE ${NANOFLANN_INCLUDE_DIR})
+    target_compile_definitions(benchmark PRIVATE LIKD_BENCH_NANOFLANN)
+  endif()
 else()
   message(STATUS "Benchmark disabled. Use -DBUILD_BENCHMARK=ON to enable.")
 endif()
