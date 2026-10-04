@@ -178,9 +178,17 @@ if (nearest) { /* use nearest->x, ... */ }
 // k nearest neighbors, sorted by distance (optionally within max_dist)
 tree.knnSearch(query, 5, results, distances);
 
-// Radius search
+// Radius search, nearest first
 float radius = 2.0f;
 tree.radiusSearch(query, radius, results, distances);
+
+// Every query also takes SearchOptions; set its fields by name. Skipping
+// the sort makes a radius search returning many points several times faster.
+KDTree<PointType>::SearchOptions options;
+options.sorted = false;  // radiusSearch: any order
+tree.radiusSearch(query, radius, results, distances, options);
+options.max_dist = 1.0f;  // knnSearch: only neighbors within 1 m
+tree.knnSearch(query, 5, results, distances, options);
 
 // Box search (boundary included)
 KDTree<PointType>::AABB box({-1.0f, -1.0f, -1.0f}, {1.0f, 1.0f, 1.0f});

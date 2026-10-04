@@ -5,6 +5,7 @@
 // sizes 2 and 32.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -76,6 +77,29 @@ Points cluster(std::mt19937& rng, size_t n, Pt c, float spread) {
   return pts;
 }
 
+// Each point with its distance, sorted: compares results in any order
+std::vector<std::array<float, 4>> hits(const Points& pts,
+                                       const std::vector<float>& d) {
+  std::vector<std::array<float, 4>> h;
+  for (size_t i = 0; i < pts.size(); ++i)
+    h.push_back({pts[i].x, pts[i].y, pts[i].z, i < d.size() ? d[i] : -1.0f});
+  std::sort(h.begin(), h.end());
+  return h;
+}
+
+// An unsorted radius search finds the same points, at the same distances, as
+// the sorted one that returned (sorted, sorted_d)
+template <typename Tree>
+bool unsortedMatches(const Tree& tree, const Pt& q, float radius,
+                     const Points& sorted, const std::vector<float>& sorted_d) {
+  typename Tree::SearchOptions unsorted;
+  unsorted.sorted = false;
+  Points res;
+  std::vector<float> d;
+  tree.radiusSearch(q, radius, res, d, unsorted);
+  return res.size() == d.size() && hits(res, d) == hits(sorted, sorted_d);
+}
+
 float bruteNearest(const Points& pts, const Pt& q) {
   float best = INFINITY;
   for (const auto& p : pts) best = std::min(best, dist(p, q));
@@ -99,7 +123,7 @@ bool matchesBruteForce(const Tree& tree, const Points& all, std::mt19937& rng,
     tree.radiusSearch(q, 6.0f, res, dists);
     size_t count = 0;
     for (const auto& p : all) count += dist(p, q) <= 6.0f;
-    ok = ok && res.size() == count;
+    ok = ok && res.size() == count && unsortedMatches(tree, q, 6.0f, res, dists);
   }
   return ok;
 }
@@ -237,6 +261,52 @@ void testBoxSearch() {
   CHECK(res.empty());
 }
 
+// The overloads taking SearchOptions answer like the original signatures, and
+// the radius search sorts by distance unless told not to.
+template <typename Tree>
+void testSearchOptions() {
+  std::printf("[search options]\n");
+  std::mt19937 rng(21);
+  Tree tree;
+  tree.build(blob(rng, 5000, 10.0f));
+  std::uniform_real_distribution<float> u(-40.0f, 40.0f);
+  Points queries;
+  for (int i = 0; i < 200; ++i) queries.push_back({u(rng), u(rng), u(rng)});
+  typename Tree::SearchOptions defaults, near, unsorted;
+  near.max_dist = 3.0f;
+  unsorted.sorted = false;
+  for (const auto& q : queries) {
+    auto a = tree.nearestNeighbors(q);
+    auto b = tree.nearestNeighbors(q, defaults);
+    CHECK(a.first && b.first && hits({*a.first}, {a.second}) == hits({*b.first}, {b.second}));
+    Points r1, r2;
+    std::vector<float> d1, d2;
+    tree.knnSearch(q, 7, r1, d1, 3.0f);
+    tree.knnSearch(q, 7, r2, d2, near);
+    CHECK(d1 == d2 && hits(r1, d1) == hits(r2, d2));
+    tree.radiusSearch(q, 6.0f, r1, d1);
+    tree.radiusSearch(q, 6.0f, r2, d2, defaults);
+    CHECK(d1 == d2 && hits(r1, d1) == hits(r2, d2));
+    CHECK(std::is_sorted(d1.begin(), d1.end()));
+    tree.radiusSearch(q, 6.0f, r2, d2, unsorted);
+    CHECK(hits(r1, d1) == hits(r2, d2));
+    typename Tree::AABB box({q.x - 5, q.y - 5, q.z - 5}, {q.x + 5, q.y + 5, q.z + 5});
+    tree.boxSearch(box, r1);
+    tree.boxSearch(box, r2, defaults);
+    CHECK(hits(r1, {}) == hits(r2, {}));
+  }
+  Points n1, n2;
+  std::vector<float> nd1, nd2;
+  tree.nearestNeighbors(queries, n1, nd1);
+  tree.nearestNeighbors(queries, n2, nd2, defaults);
+  CHECK(nd1 == nd2 && hits(n1, nd1) == hits(n2, nd2));
+  std::vector<Points> k1, k2;
+  std::vector<std::vector<float>> kd1, kd2;
+  tree.knnSearch(queries, 5, k1, kd1, 3.0f);
+  tree.knnSearch(queries, 5, k2, kd2, near);
+  CHECK(kd1 == kd2);
+}
+
 // Coordinates snapped to a 0.5 grid: many points tie on the split axes.
 Points gridBlob(std::mt19937& rng, size_t n) {
   Points pts = blob(rng, n, 4.0f);
@@ -265,7 +335,8 @@ bool sameAsModel(const Tree& tree, const Points& model, std::mt19937& rng) {
     tree.radiusSearch(q, 8.0f, res, d);
     size_t in_radius = 0;
     for (const auto& p : model) in_radius += dist(p, q) <= 8.0f;
-    if (res.size() != in_radius) return false;
+    if (res.size() != in_radius || !unsortedMatches(tree, q, 8.0f, res, d))
+      return false;
     typename Tree::AABB box({q.x - 6, q.y - 6, q.z - 6}, {q.x + 6, q.y + 6, q.z + 6});
     tree.boxSearch(box, res);
     size_t in_box = std::count_if(model.begin(), model.end(),
@@ -814,6 +885,7 @@ void bruteForceTests(const char* label) {
   testIncrementalQueries<Tree>();
   testKnnSearch<Tree>();
   testBoxSearch<Tree>();
+  testSearchOptions<Tree>();
   testDeleteDifferential<Tree>();
   testDeleteTies<Tree>();
   testDeleteAll<Tree>();

@@ -107,6 +107,15 @@ class KDTree {
     bool intersects(const AABB& box) const;
   };
 
+  // Options for the queries that take them. Each field applies to some
+  // queries only and is ignored by the others. Set the fields by name.
+  struct SearchOptions {
+    // knnSearch: leave out points farther than this
+    float max_dist = INFINITY;
+    // radiusSearch: return the points nearest first; false skips the sort
+    bool sorted = true;
+  };
+
   KDTree();
   ~KDTree();
 
@@ -118,28 +127,51 @@ class KDTree {
   // Deletes every point inside the boxes (boundary included).
   void deleteBoxes(const std::vector<AABB>& boxes, bool wait_for_rebuild = false);
   void deleteBox(const AABB& box, bool wait_for_rebuild = false);
+  // Every query also has an overload taking SearchOptions.
+  //
   // Returns a copy of the nearest point (empty if the tree is empty): a
   // background rebuild may free the node right after the lock is released.
   std::pair<std::optional<PointType>, float> nearestNeighbors(
       const PointType& query) const;
+  std::pair<std::optional<PointType>, float> nearestNeighbors(
+      const PointType& query, const SearchOptions& options) const;
   void nearestNeighbors(const PointVector<PointType>& queries,
                         PointVector<PointType>& results,
                         std::vector<float>& distances) const;
+  void nearestNeighbors(const PointVector<PointType>& queries,
+                        PointVector<PointType>& results,
+                        std::vector<float>& distances,
+                        const SearchOptions& options) const;
+  // Points within radius of the query, nearest first unless options.sorted
+  // is false.
   void radiusSearch(const PointType& query, float radius,
                     PointVector<PointType>& results,
                     std::vector<float>& distances) const;
+  void radiusSearch(const PointType& query, float radius,
+                    PointVector<PointType>& results,
+                    std::vector<float>& distances,
+                    const SearchOptions& options) const;
   // k nearest neighbors sorted by distance. Fewer than k are returned if the
   // tree is smaller or max_dist excludes the rest.
   void knnSearch(const PointType& query, int k, PointVector<PointType>& results,
                  std::vector<float>& distances,
                  float max_dist = INFINITY) const;
+  void knnSearch(const PointType& query, int k, PointVector<PointType>& results,
+                 std::vector<float>& distances,
+                 const SearchOptions& options) const;
   // Batch version; queries run in parallel with LIKD_TREE_USE_TBB.
   void knnSearch(const PointVector<PointType>& queries, int k,
                  std::vector<PointVector<PointType>>& results,
                  std::vector<std::vector<float>>& distances,
                  float max_dist = INFINITY) const;
+  void knnSearch(const PointVector<PointType>& queries, int k,
+                 std::vector<PointVector<PointType>>& results,
+                 std::vector<std::vector<float>>& distances,
+                 const SearchOptions& options) const;
   // All points inside the box (boundary included), in no particular order.
   void boxSearch(const AABB& box, PointVector<PointType>& results) const;
+  void boxSearch(const AABB& box, PointVector<PointType>& results,
+                 const SearchOptions& options) const;
   // Number of points that are not deleted. Writes still queued by a running
   // rebuild are not reflected yet.
   int size() const;
@@ -546,6 +578,13 @@ void KDTree<PointType, Traits, Options>::deleteBox(const AABB& box,
 template <typename PointType, typename Traits, typename Options>
 std::pair<std::optional<PointType>, float>
 KDTree<PointType, Traits, Options>::nearestNeighbors(const PointType& query) const {
+  return nearestNeighbors(query, SearchOptions());
+}
+
+template <typename PointType, typename Traits, typename Options>
+std::pair<std::optional<PointType>, float>
+KDTree<PointType, Traits, Options>::nearestNeighbors(
+    const PointType& query, const SearchOptions& /*options*/) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
 
   if (root_ == nullptr || root_->valid == 0) {
@@ -562,6 +601,13 @@ template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::nearestNeighbors(
     const PointVector<PointType>& queries, PointVector<PointType>& results,
     std::vector<float>& distances) const {
+  nearestNeighbors(queries, results, distances, SearchOptions());
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::nearestNeighbors(
+    const PointVector<PointType>& queries, PointVector<PointType>& results,
+    std::vector<float>& distances, const SearchOptions& /*options*/) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
 
   results.resize(queries.size());
@@ -588,6 +634,13 @@ template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::radiusSearch(
     const PointType& query, float radius, PointVector<PointType>& results,
     std::vector<float>& distances) const {
+  radiusSearch(query, radius, results, distances, SearchOptions());
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::radiusSearch(
+    const PointType& query, float radius, PointVector<PointType>& results,
+    std::vector<float>& distances, const SearchOptions& options) const {
   results.clear();
   distances.clear();
 
@@ -602,6 +655,12 @@ void KDTree<PointType, Traits, Options>::radiusSearch(
 
   const float radius2 = radius * radius;
   radiusSearchInternal(root_, query, radius2, results, distances);
+  if (!options.sorted) {
+    for (float& d : distances) {
+      d = std::sqrt(d);
+    }
+    return;
+  }
 
   std::vector<size_t> indices(results.size());
   std::iota(indices.begin(), indices.end(), 0);
@@ -638,8 +697,17 @@ void KDTree<PointType, Traits, Options>::knnSearch(const PointType& query, int k
                                           PointVector<PointType>& results,
                                           std::vector<float>& distances,
                                           float max_dist) const {
+  SearchOptions options;
+  options.max_dist = max_dist;
+  knnSearch(query, k, results, distances, options);
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::knnSearch(
+    const PointType& query, int k, PointVector<PointType>& results,
+    std::vector<float>& distances, const SearchOptions& options) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
-  knnSearchLocked(query, k, max_dist, results, distances);
+  knnSearchLocked(query, k, options.max_dist, results, distances);
 }
 
 template <typename PointType, typename Traits, typename Options>
@@ -647,6 +715,17 @@ void KDTree<PointType, Traits, Options>::knnSearch(
     const PointVector<PointType>& queries, int k,
     std::vector<PointVector<PointType>>& results,
     std::vector<std::vector<float>>& distances, float max_dist) const {
+  SearchOptions options;
+  options.max_dist = max_dist;
+  knnSearch(queries, k, results, distances, options);
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::knnSearch(
+    const PointVector<PointType>& queries, int k,
+    std::vector<PointVector<PointType>>& results,
+    std::vector<std::vector<float>>& distances,
+    const SearchOptions& options) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
   results.resize(queries.size());
   distances.resize(queries.size());
@@ -654,7 +733,7 @@ void KDTree<PointType, Traits, Options>::knnSearch(
   std::vector<size_t> indices(queries.size());
   std::iota(indices.begin(), indices.end(), 0);
   std::for_each(TREE_PAR, indices.begin(), indices.end(), [&](size_t i) {
-    knnSearchLocked(queries[i], k, max_dist, results[i], distances[i]);
+    knnSearchLocked(queries[i], k, options.max_dist, results[i], distances[i]);
   });
 }
 
@@ -686,6 +765,13 @@ void KDTree<PointType, Traits, Options>::knnSearchLocked(
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::boxSearch(const AABB& box,
                                           PointVector<PointType>& results) const {
+  boxSearch(box, results, SearchOptions());
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::boxSearch(
+    const AABB& box, PointVector<PointType>& results,
+    const SearchOptions& /*options*/) const {
   results.clear();
   std::shared_lock<SharedMutex> lock(tree_mutex_);
   boxSearchInternal(root_, box, results);
