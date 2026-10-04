@@ -5,6 +5,10 @@ Distributed under MIT license. See LICENSE for more information.
 
 // likd-tree: A Lightweight Incremental KD-Tree for dynamic point insertion
 // with automatic background rebalancing. Header-only C++17 library.
+//
+// Thread safety: queries may run concurrently with each other and with
+// writers. Writers (build / addPoints) are serialized internally, so calling
+// them from several threads is safe but gains no parallelism.
 
 #pragma once
 
@@ -13,6 +17,7 @@ Distributed under MIT license. See LICENSE for more information.
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <execution>
 #include <limits>
 #include <mutex>
@@ -69,7 +74,6 @@ class KDTree {
     bool is_left_child = false;  // true if this is parent's left child
     bool need_rebuild = false;
     Node(const PointType& pt, int ax);
-    ~Node();
   };
 
   KDTree();
@@ -77,7 +81,9 @@ class KDTree {
 
   void build(const PointVector<PointType>& pts);
   void addPoints(const PointVector<PointType>& pts, bool wait_for_rebuild = false);
-  std::pair<const PointType*, float> nearestNeighbors(
+  // Returns a copy of the nearest point (empty if the tree is empty): a
+  // background rebuild may free the node right after the lock is released.
+  std::pair<std::optional<PointType>, float> nearestNeighbors(
       const PointType& query) const;
   void nearestNeighbors(const PointVector<PointType>& queries,
                         PointVector<PointType>& results,
@@ -85,14 +91,42 @@ class KDTree {
   void radiusSearch(const PointType& query, float radius,
                     PointVector<PointType>& results,
                     std::vector<float>& distances) const;
+  // Points still buffered by a running rebuild are not counted.
   int size() const;
+  // Blocks until the background rebuild, including the insertion of points
+  // buffered while it ran, has finished.
+  void waitForRebuild() const;
 
  private:
+  // std::shared_mutex on glibc prefers readers: back-to-back queries from
+  // other threads could starve addPoints() and the rebuild swap forever.
+  // New readers therefore wait while a writer is queued.
+  class SharedMutex {
+   public:
+    void lock() {
+      waiting_writers_.fetch_add(1);
+      mutex_.lock();
+      waiting_writers_.fetch_sub(1);
+    }
+    void unlock() { mutex_.unlock(); }
+    void lock_shared() {
+      while (waiting_writers_.load() > 0)
+        std::this_thread::yield();
+      mutex_.lock_shared();
+    }
+    void unlock_shared() { mutex_.unlock_shared(); }
+
+   private:
+    std::shared_mutex mutex_;
+    std::atomic<int> waiting_writers_{0};
+  };
+
   Node* insertInternal(Node* node, const PointType& pt, int depth,
-                       std::optional<Node**> renode);
+                       std::vector<Node*>* candidates);
   void update(Node* node);
   bool needRebuild(Node* node) const;
-  void collect(Node* node, PointVector<PointType>& pts);
+  void collect(Node* node, PointVector<PointType>& pts) const;
+  static void destroy(Node* node);
   Node* buildRecursive(PointVector<PointType>& pts, size_t l, size_t r,
                        int axis);
   void nearestNeighborInternal(Node* node, const PointType& query,
@@ -102,14 +136,23 @@ class KDTree {
                             PointVector<PointType>& results,
                             std::vector<float>& distances2) const;
   bool checkAncestorNeedsRebuild(Node* node) const;
-  void backgroundRebuild(std::vector<Node*> nodes_to_rebuild);
-  void insertPendingPoints();
+  std::vector<Node*> topmostCandidates(const std::vector<Node*>& candidates) const;
+  void rebuildSubtrees(const std::vector<Node*>& nodes_to_rebuild);
+  void workerLoop();
 
   Node* root_ = nullptr;
-  mutable std::shared_mutex tree_mutex_;
+  mutable SharedMutex tree_mutex_;
+  // Serializes writers (build / addPoints).
+  std::mutex write_mutex_;
+  // Guards rebuilding_ transitions, pending_points_, rebuild_job_ and stop_.
+  mutable std::mutex pending_mutex_;
+  mutable std::condition_variable idle_cv_;
+  std::condition_variable job_cv_;
   std::atomic<bool> rebuilding_{false};
   PointVector<PointType> pending_points_;
-  std::mutex pending_mutex_;
+  std::vector<Node*> rebuild_job_;
+  bool stop_ = false;
+  std::thread worker_;
 };
 
 // AABB: axis-aligned bounding boxes
@@ -157,99 +200,104 @@ KDTree<PointType, Traits>::Node::Node(const PointType& pt, int ax)
 }
 
 template <typename PointType, typename Traits>
-KDTree<PointType, Traits>::Node::~Node() {
-  delete left;
-  delete right;
-}
-
-template <typename PointType, typename Traits>
 KDTree<PointType, Traits>::KDTree() : root_(nullptr) {}
 
 template <typename PointType, typename Traits>
 KDTree<PointType, Traits>::~KDTree() {
-  while (rebuilding_.load())
-    std::this_thread::yield();
-  std::unique_lock<std::shared_mutex> lock(tree_mutex_);
-  delete root_;
+  {
+    std::unique_lock<std::mutex> lock(pending_mutex_);
+    idle_cv_.wait(lock, [this] { return !rebuilding_.load(); });
+    stop_ = true;
+  }
+  job_cv_.notify_all();
+  if (worker_.joinable())
+    worker_.join();
+  destroy(root_);
 }
 
 template <typename PointType, typename Traits>
 void KDTree<PointType, Traits>::build(const PointVector<PointType>& pts) {
-  delete root_;
-  if (pts.empty()) {
-    root_ = nullptr;
-    return;
-  }
+  std::lock_guard<std::mutex> write_lock(write_mutex_);
+  // The worker may still hold pointers into the current tree
+  waitForRebuild();
   PointVector<PointType> tmp = pts;
-  root_ = buildRecursive(tmp, 0, tmp.size(), 0);
+  Node* new_root = tmp.empty() ? nullptr : buildRecursive(tmp, 0, tmp.size(), 0);
+  Node* old_root;
+  {
+    std::unique_lock<SharedMutex> lock(tree_mutex_);
+    old_root = root_;
+    root_ = new_root;
+  }
+  destroy(old_root);
 }
 
 template <typename PointType, typename Traits>
 void KDTree<PointType, Traits>::addPoints(const PointVector<PointType>& pts,
                                           bool wait_for_rebuild) {
-  // If rebuilding, add points to pending buffer and return
-  if (rebuilding_.load()) {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    pending_points_.insert(pending_points_.end(), pts.begin(), pts.end());
-    return;
-  }
-
-  std::vector<Node*> nodes_to_rebuild;
-
-  // Insertion + filtering phase - protected by exclusive lock
+  std::lock_guard<std::mutex> write_lock(write_mutex_);
+  bool buffered = false;
   {
-    std::unique_lock<std::shared_mutex> lock(tree_mutex_);
-    std::vector<Node*> rebuild_candidates;
-    for (const auto& p : pts) {
-      Node* renode = nullptr;
-      root_ = insertInternal(root_, p, 0, &renode);
-      if (renode) {
-        rebuild_candidates.push_back(renode);
-      }
-    }
-
-    // Filter: remove nodes whose ancestors also need rebuild
-    for (Node* candidate : rebuild_candidates) {
-      if (!checkAncestorNeedsRebuild(candidate)) {
-        nodes_to_rebuild.push_back(candidate);
-      }
+    // rebuilding_ is checked under pending_mutex_, the same lock the worker
+    // holds when it leaves the rebuilding state, so buffered points can never
+    // be left behind in pending_points_.
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (rebuilding_.load()) {
+      pending_points_.insert(pending_points_.end(), pts.begin(), pts.end());
+      buffered = true;
     }
   }
 
-  // Launch background rebuild if needed and not already rebuilding
-  if (!nodes_to_rebuild.empty() && !rebuilding_.exchange(true)) {
-    std::thread rebuild_thread(&KDTree::backgroundRebuild, this,
-                               std::move(nodes_to_rebuild));
-    rebuild_thread.detach();
+  if (!buffered) {
+    std::vector<Node*> nodes_to_rebuild;
+    // Insertion + filtering phase - protected by exclusive lock
+    {
+      std::unique_lock<SharedMutex> lock(tree_mutex_);
+      std::vector<Node*> candidates;
+      for (const auto& p : pts) {
+        root_ = insertInternal(root_, p, 0, &candidates);
+      }
+      nodes_to_rebuild = topmostCandidates(candidates);
+    }
+
+    // Hand the unbalanced subtrees to the worker. Writers are serialized and
+    // only writers set rebuilding_, so it is still false here.
+    if (!nodes_to_rebuild.empty()) {
+      {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        rebuilding_ = true;
+        rebuild_job_ = std::move(nodes_to_rebuild);
+        if (!worker_.joinable())
+          worker_ = std::thread(&KDTree::workerLoop, this);
+      }
+      job_cv_.notify_one();
+    }
   }
   // Optionally wait for rebuild to complete before returning
   if (wait_for_rebuild) {
-    while (rebuilding_.load()) {
-      std::this_thread::yield();
-    }
+    waitForRebuild();
   }
 }
 
 template <typename PointType, typename Traits>
-std::pair<const PointType*, float> KDTree<PointType, Traits>::nearestNeighbors(
-    const PointType& query) const {
-  std::shared_lock<std::shared_mutex> lock(tree_mutex_);
+std::pair<std::optional<PointType>, float>
+KDTree<PointType, Traits>::nearestNeighbors(const PointType& query) const {
+  std::shared_lock<SharedMutex> lock(tree_mutex_);
 
   if (root_ == nullptr) {
-    return {nullptr, INFINITY};
+    return {std::nullopt, INFINITY};
   }
 
   const PointType* best_pt = nullptr;
   float best_dist2 = INFINITY;
   nearestNeighborInternal(root_, query, best_pt, best_dist2);
-  return {best_pt, std::sqrt(best_dist2)};
+  return {*best_pt, std::sqrt(best_dist2)};
 }
 
 template <typename PointType, typename Traits>
 void KDTree<PointType, Traits>::nearestNeighbors(
     const PointVector<PointType>& queries, PointVector<PointType>& results,
     std::vector<float>& distances) const {
-  std::shared_lock<std::shared_mutex> lock(tree_mutex_);
+  std::shared_lock<SharedMutex> lock(tree_mutex_);
 
   results.resize(queries.size());
   distances.assign(queries.size(), INFINITY);
@@ -282,7 +330,7 @@ void KDTree<PointType, Traits>::radiusSearch(
     return;
   }
 
-  std::shared_lock<std::shared_mutex> lock(tree_mutex_);
+  std::shared_lock<SharedMutex> lock(tree_mutex_);
   if (root_ == nullptr) {
     return;
   }
@@ -322,34 +370,41 @@ void KDTree<PointType, Traits>::radiusSearch(
 
 template <typename PointType, typename Traits>
 int KDTree<PointType, Traits>::size() const {
+  std::shared_lock<SharedMutex> lock(tree_mutex_);
   return root_ ? root_->subtree_size : 0;
+}
+
+template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::waitForRebuild() const {
+  std::unique_lock<std::mutex> lock(pending_mutex_);
+  idle_cv_.wait(lock, [this] { return !rebuilding_.load(); });
 }
 
 template <typename PointType, typename Traits>
 typename KDTree<PointType, Traits>::Node*
 KDTree<PointType, Traits>::insertInternal(Node* node, const PointType& pt,
                                           int depth,
-                                          std::optional<Node**> renode) {
+                                          std::vector<Node*>* candidates) {
   if (!node)
     return new Node(pt, depth % Traits::DIM);
   int ax = node->axis;
   float v = Traits::coord(pt, ax);
   float nv = Traits::coord(node->point, ax);
   if (v < nv) {
-    node->left = insertInternal(node->left, pt, depth + 1, renode);
+    node->left = insertInternal(node->left, pt, depth + 1, candidates);
     node->left->parent = node;
     node->left->is_left_child = true;
   } else {
-    node->right = insertInternal(node->right, pt, depth + 1, renode);
+    node->right = insertInternal(node->right, pt, depth + 1, candidates);
     node->right->parent = node;
     node->right->is_left_child = false;
   }
   update(node);
   // Only set need_rebuild to true, never clear it
   // Only delete a node marked by need_rebuild in rebuilding thread
-  if (renode && !node->need_rebuild && needRebuild(node)) {
+  if (candidates && !node->need_rebuild && needRebuild(node)) {
     node->need_rebuild = true;
-    **renode = node;
+    candidates->push_back(node);
   }
   return node;
 }
@@ -378,14 +433,39 @@ bool KDTree<PointType, Traits>::needRebuild(Node* node) const {
          node->subtree_size >= MIN_SUB_NUM;
 }
 
+// Iterative: an unbalanced chain must not overflow the stack.
 template <typename PointType, typename Traits>
 void KDTree<PointType, Traits>::collect(Node* node,
-                                        PointVector<PointType>& pts) {
+                                        PointVector<PointType>& pts) const {
   if (!node)
     return;
-  pts.push_back(node->point);
-  collect(node->left, pts);
-  collect(node->right, pts);
+  pts.reserve(pts.size() + node->subtree_size);
+  std::vector<Node*> stack{node};
+  while (!stack.empty()) {
+    Node* n = stack.back();
+    stack.pop_back();
+    pts.push_back(n->point);
+    if (n->left)
+      stack.push_back(n->left);
+    if (n->right)
+      stack.push_back(n->right);
+  }
+}
+
+template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::destroy(Node* node) {
+  std::vector<Node*> stack;
+  if (node)
+    stack.push_back(node);
+  while (!stack.empty()) {
+    Node* n = stack.back();
+    stack.pop_back();
+    if (n->left)
+      stack.push_back(n->left);
+    if (n->right)
+      stack.push_back(n->right);
+    delete n;
+  }
 }
 
 template <typename PointType, typename Traits>
@@ -467,10 +547,26 @@ bool KDTree<PointType, Traits>::checkAncestorNeedsRebuild(Node* node) const {
   return needs_rebuild;
 }
 
-// Background rebuild runs in separate thread
+// Filter: remove nodes whose ancestors also need rebuild
 template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::backgroundRebuild(
-    std::vector<Node*> nodes_to_rebuild) {
+std::vector<typename KDTree<PointType, Traits>::Node*>
+KDTree<PointType, Traits>::topmostCandidates(
+    const std::vector<Node*>& candidates) const {
+  std::vector<Node*> topmost;
+  for (Node* candidate : candidates) {
+    if (!checkAncestorNeedsRebuild(candidate)) {
+      topmost.push_back(candidate);
+    }
+  }
+  return topmost;
+}
+
+// Runs on the worker thread while rebuilding_ is set, i.e. while every writer
+// is diverted to pending_points_: the old subtrees can be read without the
+// tree lock.
+template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::rebuildSubtrees(
+    const std::vector<Node*>& nodes_to_rebuild) {
   // Pre-allocate new_nodes for thread-safe parallel access
   std::vector<Node*> new_nodes(nodes_to_rebuild.size());
 
@@ -491,7 +587,7 @@ void KDTree<PointType, Traits>::backgroundRebuild(
 
   // Critical section - swap pointers (brief exclusive lock)
   {
-    std::unique_lock<std::shared_mutex> lock(tree_mutex_);
+    std::unique_lock<SharedMutex> lock(tree_mutex_);
 
     for (size_t i = 0; i < nodes_to_rebuild.size(); ++i) {
       Node* new_node = new_nodes[i];
@@ -507,42 +603,56 @@ void KDTree<PointType, Traits>::backgroundRebuild(
         // This was the root
         root_ = new_node;
       }
-      // Delete old subtree
-      delete nodes_to_rebuild[i];
     }
   }
-  // try to insert pending points accumulated during rebuild
-  // the work will not block qeueries for too long.
-  insertPendingPoints();
-  // Lock released
-  rebuilding_ = false;
+  // Readers can no longer reach the old subtrees: free them outside the lock
+  for (Node* old_node : nodes_to_rebuild) {
+    destroy(old_node);
+  }
 }
 
-// Insert pending points that accumulated during rebuild
+// Background rebuild thread: started on the first rebuild, joined in ~KDTree
 template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::insertPendingPoints() {
-  PointVector<PointType> points_to_insert;
-
-  // Move pending points to local buffer
-  {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    if (pending_points_.empty()) {
-      return;
+void KDTree<PointType, Traits>::workerLoop() {
+  std::unique_lock<std::mutex> lock(pending_mutex_);
+  while (true) {
+    job_cv_.wait(lock, [this] { return stop_ || !rebuild_job_.empty(); });
+    if (rebuild_job_.empty()) {
+      return;  // stop requested
     }
-    points_to_insert = std::move(pending_points_);
-    pending_points_.clear();
-  }
-
-  // Insert in small batches to allow queries to interleave
-  for (size_t i = 0; i < points_to_insert.size(); i += INSERTION_BATCH_SIZE) {
-    {
-      std::unique_lock<std::shared_mutex> lock(tree_mutex_);
-
-      size_t end = std::min(i + INSERTION_BATCH_SIZE, points_to_insert.size());
-      for (size_t j = i; j < end; ++j) {
-        root_ = insertInternal(root_, points_to_insert[j], 0, std::nullopt);
+    std::vector<Node*> job = std::move(rebuild_job_);
+    rebuild_job_.clear();
+    while (true) {
+      lock.unlock();
+      if (!job.empty()) {
+        rebuildSubtrees(job);
       }
+      lock.lock();
+      // Leave the rebuilding state only after seeing an empty buffer while
+      // holding pending_mutex_: writers check rebuilding_ under this lock.
+      if (pending_points_.empty()) {
+        break;
+      }
+      PointVector<PointType> points_to_insert = std::move(pending_points_);
+      pending_points_.clear();
+      lock.unlock();
+
+      // Insert in small batches to allow queries to interleave. Imbalance
+      // caused by these points is detected too and rebuilt in the next round.
+      std::vector<Node*> candidates;
+      for (size_t i = 0; i < points_to_insert.size(); i += INSERTION_BATCH_SIZE) {
+        std::unique_lock<SharedMutex> tree_lock(tree_mutex_);
+        size_t end = std::min(i + INSERTION_BATCH_SIZE, points_to_insert.size());
+        for (size_t j = i; j < end; ++j) {
+          root_ = insertInternal(root_, points_to_insert[j], 0, &candidates);
+        }
+        if (end == points_to_insert.size()) {
+          job = topmostCandidates(candidates);
+        }
+      }
+      lock.lock();
     }
-    std::this_thread::yield();
+    rebuilding_ = false;
+    idle_cv_.notify_all();
   }
 }

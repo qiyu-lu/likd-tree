@@ -64,6 +64,18 @@ test/demo.cpp
 target_link_libraries(demo kdtree ${LIKD_TREE_PCL_LIBRARIES})
 target_link_libraries(demo Threads::Threads)
 
+# Unit tests (always built, no PCL needed): ctest --test-dir build
+enable_testing()
+add_executable(unit_tests test/unit_tests.cpp)
+target_link_libraries(unit_tests kdtree Threads::Threads)
+add_test(NAME unit_tests COMMAND unit_tests)
+if(TBB_FOUND)
+  add_executable(unit_tests_tbb test/unit_tests.cpp)
+  target_compile_definitions(unit_tests_tbb PRIVATE LIKD_TREE_USE_TBB)
+  target_link_libraries(unit_tests_tbb kdtree Threads::Threads)
+  add_test(NAME unit_tests_tbb COMMAND unit_tests_tbb)
+endif()
+
 if(LIKD_TREE_PCL_VISUALIZATION_FOUND)
   add_executable(nearest_search_pcd_demo
     test/nearest_search_pcd_demo.cpp
