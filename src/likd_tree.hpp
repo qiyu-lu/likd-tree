@@ -111,15 +111,6 @@ class KDTree {
     bool intersects(const AABB& box) const;
   };
 
-  // Options for the queries that take them. Each field applies to some
-  // queries only and is ignored by the others. Set the fields by name.
-  struct SearchOptions {
-    // knnSearch: leave out points farther than this
-    float max_dist = INFINITY;
-    // radiusSearch: return the points nearest first; false skips the sort
-    bool sorted = true;
-  };
-
   // A point's stamp, kept with Options::TRACK_STAMPS: a frame number or a
   // time, in any unit that never decreases and does not wrap. kNever, the
   // largest value, means the point never expires; writes without a stamp
@@ -127,6 +118,24 @@ class KDTree {
   struct Stamp {
     static constexpr uint32_t kNever = std::numeric_limits<uint32_t>::max();
     uint32_t value = 0;
+  };
+
+  // The field SearchOptions has only with Options::TRACK_STAMPS
+  struct NoStampFilter {};
+  struct StampFilter {
+    // Every query: leave out points stamped earlier. The default leaves out
+    // none.
+    Stamp min_stamp;
+  };
+
+  // Options for the queries that take them. Each field applies to some
+  // queries only and is ignored by the others. Set the fields by name.
+  struct SearchOptions
+      : std::conditional_t<TrackStamps, StampFilter, NoStampFilter> {
+    // knnSearch: leave out points farther than this
+    float max_dist = INFINITY;
+    // radiusSearch: return the points nearest first; false skips the sort
+    bool sorted = true;
   };
 
   KDTree();
@@ -138,7 +147,8 @@ class KDTree {
   void build(const PointVector<PointType>& pts, Stamp stamp);
   void addPoints(const PointVector<PointType>& pts, Stamp stamp,
                  bool wait_for_rebuild = false);
-  // Deletes one stored copy of each point whose coordinates match exactly.
+  // Deletes one stored copy of each point whose coordinates match exactly:
+  // with Options::TRACK_STAMPS, the one with the oldest stamp.
   void deletePoints(const PointVector<PointType>& pts,
                     bool wait_for_rebuild = false);
   // Deletes every point inside the boxes (boundary included).
@@ -347,6 +357,19 @@ class KDTree {
                    StampArg stamp);
   static StampArg opStamp(const Op& op);
   static void clearStampBounds(Node* node);
+  // The stamp a query filters by: 0, which leaves out nothing, without stamps
+  static uint32_t minStamp(const SearchOptions& options);
+  // Runs query(std::true_type) if min_stamp leaves out points, else
+  // query(std::false_type). Without stamps only the latter is compiled.
+  template <typename Query>
+  static void withStampFilter(uint32_t min_stamp, Query&& query);
+  // Whether a query can find points below n: some are not deleted and, when
+  // filtering by stamp, some are stamped min_stamp or later
+  template <bool Filter>
+  static bool live(const Node* n, uint32_t min_stamp);
+  // Calls fn(i) for each slot whose point a query can find
+  template <bool Filter, typename Fn>
+  static void forEachLive(const Leaf* leaf, uint32_t min_stamp, Fn&& fn);
   static Mask bit(int i) { return Mask(1) << i; }
   // The lowest n bits; n may equal the width of Mask
   static Mask lowBits(int n) {
@@ -371,6 +394,9 @@ class KDTree {
   Node* makeRoom(Leaf* leaf);
   bool deletePointInternal(Node* node, const PointType& pt,
                            std::vector<Node*>* candidates);
+  // Finds the copy of pt with the oldest stamp below node
+  void findOldest(Node* node, const PointType& pt, Leaf*& leaf, int& slot,
+                  uint32_t& oldest);
   int deleteBoxInternal(Node* node, const AABB& box,
                         std::vector<Node*>* candidates);
   static void killSubtree(Node* node);
@@ -380,26 +406,36 @@ class KDTree {
   static void updateInner(Inner* node);
   bool needRebuild(const Inner* node) const;
   void markIfUnbalanced(Inner* node, std::vector<Node*>* candidates);
-  // Appends the non-deleted points below node to out, a PointVector or an
-  // ItemVector
-  template <typename Vec>
-  void collect(const Node* node, Vec& out) const;
+  // Appends the points below node a query can find to out, a PointVector or
+  // an ItemVector
+  template <bool Filter = false, typename Vec>
+  void collect(const Node* node, Vec& out, uint32_t min_stamp = 0) const;
   void destroy(Node* node);
   Node* buildRecursive(ItemVector& items, size_t l, size_t r);
+  // With Filter, the query skips points stamped before min_stamp
+  template <bool Filter>
   void nearestNeighborInternal(const Node* node, const PointType& query,
-                               const PointType*& best_pt,
+                               uint32_t min_stamp, const PointType*& best_pt,
                                float& best_dist2) const;
+  // Caller holds tree_mutex_ (shared); best_pt stays null if nothing is found
+  void nearestNeighborLocked(const PointType& query, uint32_t min_stamp,
+                             const PointType*& best_pt, float& best_dist2) const;
+  template <bool Filter>
   void radiusSearchInternal(const Node* node, const PointType& query,
-                            float radius2, PointVector<PointType>& results,
+                            float radius2, uint32_t min_stamp,
+                            PointVector<PointType>& results,
                             std::vector<float>& distances2) const;
   // best: (squared distance, point), ascending, at most k entries
+  template <bool Filter>
   void knnSearchInternal(const Node* node, const PointType& query, size_t k,
-                         float max_dist2,
+                         float max_dist2, uint32_t min_stamp,
                          std::vector<std::pair<float, const PointType*>>& best) const;
-  void knnSearchLocked(const PointType& query, int k, float max_dist,
+  void knnSearchLocked(const PointType& query, int k,
+                       const SearchOptions& options,
                        PointVector<PointType>& results,
                        std::vector<float>& distances) const;
-  void boxSearchInternal(const Node* node, const AABB& box,
+  template <bool Filter>
+  void boxSearchInternal(const Node* node, const AABB& box, uint32_t min_stamp,
                          PointVector<PointType>& results) const;
   bool checkAncestorNeedsRebuild(Node* node) const;
   std::vector<Node*> topmostCandidates(const std::vector<Node*>& candidates) const;
@@ -698,16 +734,14 @@ KDTree<PointType, Traits, Options>::nearestNeighbors(const PointType& query) con
 template <typename PointType, typename Traits, typename Options>
 std::pair<std::optional<PointType>, float>
 KDTree<PointType, Traits, Options>::nearestNeighbors(
-    const PointType& query, const SearchOptions& /*options*/) const {
+    const PointType& query, const SearchOptions& options) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
-
-  if (root_ == nullptr || root_->valid == 0) {
-    return {std::nullopt, INFINITY};
-  }
-
   const PointType* best_pt = nullptr;
   float best_dist2 = INFINITY;
-  nearestNeighborInternal(root_, query, best_pt, best_dist2);
+  nearestNeighborLocked(query, minStamp(options), best_pt, best_dist2);
+  if (best_pt == nullptr) {
+    return {std::nullopt, INFINITY};
+  }
   return {*best_pt, std::sqrt(best_dist2)};
 }
 
@@ -721,7 +755,7 @@ void KDTree<PointType, Traits, Options>::nearestNeighbors(
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::nearestNeighbors(
     const PointVector<PointType>& queries, PointVector<PointType>& results,
-    std::vector<float>& distances, const SearchOptions& /*options*/) const {
+    std::vector<float>& distances, const SearchOptions& options) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
 
   results.resize(queries.size());
@@ -735,12 +769,29 @@ void KDTree<PointType, Traits, Options>::nearestNeighbors(
   std::vector<size_t> indices(queries.size());
   std::iota(indices.begin(), indices.end(), 0);
 
+  const uint32_t min_stamp = minStamp(options);
   std::for_each(TREE_PAR, indices.begin(), indices.end(), [&](size_t i) {
     const PointType* best_pt = nullptr;
     float best_dist2 = INFINITY;
-    nearestNeighborInternal(root_, queries[i], best_pt, best_dist2);
-    distances[i] = std::sqrt(best_dist2);
-    results[i] = *best_pt;
+    nearestNeighborLocked(queries[i], min_stamp, best_pt, best_dist2);
+    if (best_pt != nullptr) {
+      distances[i] = std::sqrt(best_dist2);
+      results[i] = *best_pt;
+    }
+  });
+}
+
+// Caller holds tree_mutex_ (shared)
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::nearestNeighborLocked(
+    const PointType& query, uint32_t min_stamp, const PointType*& best_pt,
+    float& best_dist2) const {
+  withStampFilter(min_stamp, [&](auto filter) {
+    constexpr bool kFilter = decltype(filter)::value;
+    if (root_ != nullptr && live<kFilter>(root_, min_stamp)) {
+      nearestNeighborInternal<kFilter>(root_, query, min_stamp, best_pt,
+                                       best_dist2);
+    }
   });
 }
 
@@ -768,7 +819,11 @@ void KDTree<PointType, Traits, Options>::radiusSearch(
   }
 
   const float radius2 = radius * radius;
-  radiusSearchInternal(root_, query, radius2, results, distances);
+  const uint32_t min_stamp = minStamp(options);
+  withStampFilter(min_stamp, [&](auto filter) {
+    radiusSearchInternal<decltype(filter)::value>(root_, query, radius2,
+                                                   min_stamp, results, distances);
+  });
   if (!options.sorted) {
     for (float& d : distances) {
       d = std::sqrt(d);
@@ -821,7 +876,7 @@ void KDTree<PointType, Traits, Options>::knnSearch(
     const PointType& query, int k, PointVector<PointType>& results,
     std::vector<float>& distances, const SearchOptions& options) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
-  knnSearchLocked(query, k, options.max_dist, results, distances);
+  knnSearchLocked(query, k, options, results, distances);
 }
 
 template <typename PointType, typename Traits, typename Options>
@@ -847,26 +902,32 @@ void KDTree<PointType, Traits, Options>::knnSearch(
   std::vector<size_t> indices(queries.size());
   std::iota(indices.begin(), indices.end(), 0);
   std::for_each(TREE_PAR, indices.begin(), indices.end(), [&](size_t i) {
-    knnSearchLocked(queries[i], k, options.max_dist, results[i], distances[i]);
+    knnSearchLocked(queries[i], k, options, results[i], distances[i]);
   });
 }
 
 // Caller holds tree_mutex_ (shared)
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::knnSearchLocked(
-    const PointType& query, int k, float max_dist,
+    const PointType& query, int k, const SearchOptions& options,
     PointVector<PointType>& results, std::vector<float>& distances) const {
   results.clear();
   distances.clear();
+  const float max_dist = options.max_dist;
   if (k <= 0 || root_ == nullptr || root_->valid == 0 || max_dist < 0.0f) {
     return;
   }
   const float max_dist2 = std::isinf(max_dist) ? INFINITY : max_dist * max_dist;
+  const uint32_t min_stamp = minStamp(options);
   std::vector<std::pair<float, const PointType*>> best;
   best.reserve(k + 1);
-  if (root_->aabb.sqrDist(query) <= max_dist2) {
-    knnSearchInternal(root_, query, k, max_dist2, best);
-  }
+  withStampFilter(min_stamp, [&](auto filter) {
+    constexpr bool kFilter = decltype(filter)::value;
+    if (live<kFilter>(root_, min_stamp) &&
+        root_->aabb.sqrDist(query) <= max_dist2) {
+      knnSearchInternal<kFilter>(root_, query, k, max_dist2, min_stamp, best);
+    }
+  });
   // Copy while the lock is held: a background rebuild may free the nodes
   results.reserve(best.size());
   distances.reserve(best.size());
@@ -885,10 +946,13 @@ void KDTree<PointType, Traits, Options>::boxSearch(const AABB& box,
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::boxSearch(
     const AABB& box, PointVector<PointType>& results,
-    const SearchOptions& /*options*/) const {
+    const SearchOptions& options) const {
   results.clear();
   std::shared_lock<SharedMutex> lock(tree_mutex_);
-  boxSearchInternal(root_, box, results);
+  const uint32_t min_stamp = minStamp(options);
+  withStampFilter(min_stamp, [&](auto filter) {
+    boxSearchInternal<decltype(filter)::value>(root_, box, min_stamp, results);
+  });
 }
 
 template <typename PointType, typename Traits, typename Options>
@@ -1115,6 +1179,53 @@ void KDTree<PointType, Traits, Options>::clearStampBounds(
 }
 
 template <typename PointType, typename Traits, typename Options>
+uint32_t KDTree<PointType, Traits, Options>::minStamp(
+    [[maybe_unused]] const SearchOptions& options) {
+  if constexpr (TrackStamps)
+    return options.min_stamp.value;
+  else
+    return 0;
+}
+
+template <typename PointType, typename Traits, typename Options>
+template <typename Query>
+void KDTree<PointType, Traits, Options>::withStampFilter(
+    [[maybe_unused]] uint32_t min_stamp, Query&& query) {
+  if constexpr (TrackStamps) {
+    if (min_stamp > 0) {
+      query(std::true_type{});
+      return;
+    }
+  }
+  query(std::false_type{});
+}
+
+template <typename PointType, typename Traits, typename Options>
+template <bool Filter>
+bool KDTree<PointType, Traits, Options>::live(const Node* n,
+                                     [[maybe_unused]] uint32_t min_stamp) {
+  if constexpr (Filter)
+    return n->valid > 0 && n->t_max >= min_stamp;
+  else
+    return n->valid > 0;
+}
+
+template <typename PointType, typename Traits, typename Options>
+template <bool Filter, typename Fn>
+void KDTree<PointType, Traits, Options>::forEachLive(
+    const Leaf* leaf, [[maybe_unused]] uint32_t min_stamp, Fn&& fn) {
+  if constexpr (Filter) {
+    const uint32_t* stamps = stampsOf(leaf);
+    forEachValid(leaf, [&](int i) {
+      if (stamps[i] >= min_stamp)
+        fn(i);
+    });
+  } else {
+    forEachValid(leaf, fn);
+  }
+}
+
+template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::applyOp(const Op& op,
                                         std::vector<Node*>* candidates) {
   switch (op.type) {
@@ -1236,30 +1347,75 @@ KDTree<PointType, Traits, Options>::makeRoom(Leaf* leaf) {
 
 // Descends by bounding box rather than by the split comparison: nth_element
 // leaves points equal to the median on both sides, so "equal goes right"
-// would miss them.
+// would miss them. With stamps it deletes the copy with the oldest stamp,
+// which can only be known after looking at every copy; node is then the root.
 template <typename PointType, typename Traits, typename Options>
 bool KDTree<PointType, Traits, Options>::deletePointInternal(
     Node* node, const PointType& pt, std::vector<Node*>* candidates) {
-  if (!node || node->valid == 0 || !node->aabb.contains(pt))
-    return false;
-  if (node->is_leaf) {
-    Leaf* leaf = asLeaf(node);
-    for (int i = 0; i < leaf->size; ++i) {
-      if (!(leaf->deleted & bit(i)) && samePoint(leaf->pts[i], pt)) {
-        leaf->deleted |= bit(i);
-        updateLeaf(leaf);
-        return true;
-      }
+  if constexpr (TrackStamps) {
+    Leaf* leaf = nullptr;
+    int slot = 0;
+    uint32_t oldest = 0;
+    findOldest(node, pt, leaf, slot, oldest);
+    if (leaf == nullptr)
+      return false;
+    leaf->deleted |= bit(slot);
+    updateLeaf(leaf);
+    for (Node* n = leaf->parent; n != nullptr; n = n->parent) {
+      updateInner(asInner(n));
+      markIfUnbalanced(asInner(n), candidates);
     }
-    return false;
+    return true;
+  } else {
+    if (!node || node->valid == 0 || !node->aabb.contains(pt))
+      return false;
+    if (node->is_leaf) {
+      Leaf* leaf = asLeaf(node);
+      for (int i = 0; i < leaf->size; ++i) {
+        if (!(leaf->deleted & bit(i)) && samePoint(leaf->pts[i], pt)) {
+          leaf->deleted |= bit(i);
+          updateLeaf(leaf);
+          return true;
+        }
+      }
+      return false;
+    }
+    Inner* inner = asInner(node);
+    if (!deletePointInternal(inner->left, pt, candidates) &&
+        !deletePointInternal(inner->right, pt, candidates))
+      return false;
+    updateInner(inner);
+    markIfUnbalanced(inner, candidates);
+    return true;
   }
-  Inner* inner = asInner(node);
-  if (!deletePointInternal(inner->left, pt, candidates) &&
-      !deletePointInternal(inner->right, pt, candidates))
-    return false;
-  updateInner(inner);
-  markIfUnbalanced(inner, candidates);
-  return true;
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::findOldest(
+    [[maybe_unused]] Node* node, [[maybe_unused]] const PointType& pt,
+    [[maybe_unused]] Leaf*& leaf, [[maybe_unused]] int& slot,
+    [[maybe_unused]] uint32_t& oldest) {
+  if constexpr (TrackStamps) {
+    if (!node || node->valid == 0 || !node->aabb.contains(pt))
+      return;
+    // No copy below can be older than the one already found
+    if (leaf != nullptr && node->t_min >= oldest)
+      return;
+    if (node->is_leaf) {
+      Leaf* l = asLeaf(node);
+      const uint32_t* stamps = stampsOf(l);
+      forEachValid(l, [&](int i) {
+        if (samePoint(l->pts[i], pt) && (leaf == nullptr || stamps[i] < oldest)) {
+          leaf = l;
+          slot = i;
+          oldest = stamps[i];
+        }
+      });
+      return;
+    }
+    findOldest(asInner(node)->left, pt, leaf, slot, oldest);
+    findOldest(asInner(node)->right, pt, leaf, slot, oldest);
+  }
 }
 
 // Returns the number of points deleted
@@ -1396,19 +1552,20 @@ void KDTree<PointType, Traits, Options>::markIfUnbalanced(
 
 // Iterative: an unbalanced chain must not overflow the stack.
 template <typename PointType, typename Traits, typename Options>
-template <typename Vec>
-void KDTree<PointType, Traits, Options>::collect(const Node* node, Vec& out) const {
+template <bool Filter, typename Vec>
+void KDTree<PointType, Traits, Options>::collect(const Node* node, Vec& out,
+                                        uint32_t min_stamp) const {
   if (!node)
     return;
   std::vector<const Node*> stack{node};
   while (!stack.empty()) {
     const Node* n = stack.back();
     stack.pop_back();
-    if (n->valid == 0)
+    if (!live<Filter>(n, min_stamp))
       continue;
     if (n->is_leaf) {
       const Leaf* leaf = asLeaf(n);
-      forEachValid(leaf, [&](int i) {
+      forEachLive<Filter>(leaf, min_stamp, [&](int i) {
         if constexpr (std::is_same_v<typename Vec::value_type, PointType>)
           out.push_back(leaf->pts[i]);
         else
@@ -1504,14 +1661,15 @@ KDTree<PointType, Traits, Options>::buildRecursive(ItemVector& items, size_t l,
   return node;
 }
 
-// Called only on nodes with valid > 0
+// Called only on live nodes
 template <typename PointType, typename Traits, typename Options>
+template <bool Filter>
 void KDTree<PointType, Traits, Options>::nearestNeighborInternal(
-    const Node* node, const PointType& query, const PointType*& best_pt,
-    float& best_dist2) const {
+    const Node* node, const PointType& query, uint32_t min_stamp,
+    const PointType*& best_pt, float& best_dist2) const {
   if (node->is_leaf) {
     const Leaf* leaf = asLeaf(node);
-    forEachValid(leaf, [&](int i) {
+    forEachLive<Filter>(leaf, min_stamp, [&](int i) {
       float d2 = Traits::sqrDist(leaf->pts[i], query);
       if (d2 < best_dist2) {
         best_dist2 = d2;
@@ -1524,21 +1682,25 @@ void KDTree<PointType, Traits, Options>::nearestNeighborInternal(
   bool left_first = Traits::coord(query, inner->axis) < inner->split;
   const Node* near = left_first ? inner->left : inner->right;
   const Node* far = left_first ? inner->right : inner->left;
-  if (near && near->valid > 0 && near->aabb.sqrDist(query) < best_dist2)
-    nearestNeighborInternal(near, query, best_pt, best_dist2);
-  if (far && far->valid > 0 && far->aabb.sqrDist(query) < best_dist2)
-    nearestNeighborInternal(far, query, best_pt, best_dist2);
+  if (near && live<Filter>(near, min_stamp) &&
+      near->aabb.sqrDist(query) < best_dist2)
+    nearestNeighborInternal<Filter>(near, query, min_stamp, best_pt, best_dist2);
+  if (far && live<Filter>(far, min_stamp) &&
+      far->aabb.sqrDist(query) < best_dist2)
+    nearestNeighborInternal<Filter>(far, query, min_stamp, best_pt, best_dist2);
 }
 
 template <typename PointType, typename Traits, typename Options>
+template <bool Filter>
 void KDTree<PointType, Traits, Options>::radiusSearchInternal(
-    const Node* node, const PointType& query, float radius2,
+    const Node* node, const PointType& query, float radius2, uint32_t min_stamp,
     PointVector<PointType>& results, std::vector<float>& distances2) const {
-  if (!node || node->valid == 0 || node->aabb.sqrDist(query) > radius2)
+  if (!node || !live<Filter>(node, min_stamp) ||
+      node->aabb.sqrDist(query) > radius2)
     return;
   if (node->is_leaf) {
     const Leaf* leaf = asLeaf(node);
-    forEachValid(leaf, [&](int i) {
+    forEachLive<Filter>(leaf, min_stamp, [&](int i) {
       float d2 = Traits::sqrDist(leaf->pts[i], query);
       if (d2 <= radius2) {
         results.push_back(leaf->pts[i]);
@@ -1548,18 +1710,22 @@ void KDTree<PointType, Traits, Options>::radiusSearchInternal(
     return;
   }
   const Inner* inner = asInner(node);
-  radiusSearchInternal(inner->left, query, radius2, results, distances2);
-  radiusSearchInternal(inner->right, query, radius2, results, distances2);
+  radiusSearchInternal<Filter>(inner->left, query, radius2, min_stamp, results,
+                               distances2);
+  radiusSearchInternal<Filter>(inner->right, query, radius2, min_stamp, results,
+                               distances2);
 }
 
-// Called only on nodes with valid > 0
+// Called only on live nodes
 template <typename PointType, typename Traits, typename Options>
+template <bool Filter>
 void KDTree<PointType, Traits, Options>::knnSearchInternal(
     const Node* node, const PointType& query, size_t k, float max_dist2,
+    uint32_t min_stamp,
     std::vector<std::pair<float, const PointType*>>& best) const {
   if (node->is_leaf) {
     const Leaf* leaf = asLeaf(node);
-    forEachValid(leaf, [&](int i) {
+    forEachLive<Filter>(leaf, min_stamp, [&](int i) {
       float d2 = Traits::sqrDist(leaf->pts[i], query);
       if (d2 <= max_dist2 && (best.size() < k || d2 < best.back().first)) {
         if (best.size() == k)
@@ -1579,37 +1745,39 @@ void KDTree<PointType, Traits, Options>::knnSearchInternal(
   const Node* near = left_first ? inner->left : inner->right;
   const Node* far = left_first ? inner->right : inner->left;
   // Search radius: the k-th best so far, or max_dist until k are found
-  if (near && near->valid > 0 &&
+  if (near && live<Filter>(near, min_stamp) &&
       near->aabb.sqrDist(query) <=
           (best.size() < k ? max_dist2 : best.back().first))
-    knnSearchInternal(near, query, k, max_dist2, best);
-  if (far && far->valid > 0 &&
+    knnSearchInternal<Filter>(near, query, k, max_dist2, min_stamp, best);
+  if (far && live<Filter>(far, min_stamp) &&
       far->aabb.sqrDist(query) <=
           (best.size() < k ? max_dist2 : best.back().first))
-    knnSearchInternal(far, query, k, max_dist2, best);
+    knnSearchInternal<Filter>(far, query, k, max_dist2, min_stamp, best);
 }
 
 template <typename PointType, typename Traits, typename Options>
+template <bool Filter>
 void KDTree<PointType, Traits, Options>::boxSearchInternal(
-    const Node* node, const AABB& box, PointVector<PointType>& results) const {
-  if (!node || node->valid == 0 || !box.intersects(node->aabb))
+    const Node* node, const AABB& box, uint32_t min_stamp,
+    PointVector<PointType>& results) const {
+  if (!node || !live<Filter>(node, min_stamp) || !box.intersects(node->aabb))
     return;
   if (box.contains(node->aabb)) {
     // Whole subtree inside: no per-point test needed
-    collect(node, results);
+    collect<Filter>(node, results, min_stamp);
     return;
   }
   if (node->is_leaf) {
     const Leaf* leaf = asLeaf(node);
-    forEachValid(leaf, [&](int i) {
+    forEachLive<Filter>(leaf, min_stamp, [&](int i) {
       if (box.contains(leaf->pts[i]))
         results.push_back(leaf->pts[i]);
     });
     return;
   }
   const Inner* inner = asInner(node);
-  boxSearchInternal(inner->left, box, results);
-  boxSearchInternal(inner->right, box, results);
+  boxSearchInternal<Filter>(inner->left, box, min_stamp, results);
+  boxSearchInternal<Filter>(inner->right, box, min_stamp, results);
 }
 
 template <typename PointType, typename Traits, typename Options>

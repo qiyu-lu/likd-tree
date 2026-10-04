@@ -975,6 +975,144 @@ void testStampsFollowPoints() {
         }));
 }
 
+// A brute-force model of a stamped tree: each point with its stamp
+struct StampedPt {
+  Pt p;
+  uint32_t stamp;
+};
+
+std::vector<StampedEntry> entriesOf(const std::vector<StampedPt>& model) {
+  std::vector<StampedEntry> out;
+  for (const auto& e : model) out.push_back({{e.p.x, e.p.y, e.p.z}, e.stamp});
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// Deletes the copy of p with the oldest stamp, if there is one
+void eraseOldest(std::vector<StampedPt>& model, const Pt& p) {
+  auto oldest = model.end();
+  for (auto it = model.begin(); it != model.end(); ++it) {
+    if (it->p.x == p.x && it->p.y == p.y && it->p.z == p.z &&
+        (oldest == model.end() || it->stamp < oldest->stamp))
+      oldest = it;
+  }
+  if (oldest != model.end()) {
+    *oldest = model.back();
+    model.pop_back();
+  }
+}
+
+// Every query that takes SearchOptions finds exactly the model's points
+// stamped min_stamp or later
+template <typename Tree>
+bool sameAsStampedModel(const Tree& tree, const std::vector<StampedPt>& model,
+                        uint32_t min_stamp, std::mt19937& rng) {
+  typename Tree::SearchOptions opts;
+  opts.min_stamp = typename Tree::Stamp{min_stamp};
+  Points live;
+  for (const auto& e : model)
+    if (e.stamp >= min_stamp) live.push_back(e.p);
+  std::uniform_real_distribution<float> u(-60.0f, 60.0f);
+  Points queries;
+  for (int i = 0; i < 20; ++i) queries.push_back({u(rng), u(rng), u(rng)});
+  for (size_t i = 0; i < queries.size(); ++i) {
+    const Pt& q = queries[i];
+    int k = 1 + i % 8;
+    Points res;
+    std::vector<float> d;
+    tree.knnSearch(q, k, res, d, opts);
+    if (!sameDistances(d, bruteKnn(live, q, k))) return false;
+    auto [nearest, nd] = tree.nearestNeighbors(q, opts);
+    if (live.empty() ? nearest.has_value()
+                     : !nearest || std::fabs(nd - bruteNearest(live, q)) > 1e-4f)
+      return false;
+    Points in_radius;
+    std::vector<float> in_radius_d;
+    for (const auto& p : live) {
+      if (dist(p, q) <= 8.0f) {
+        in_radius.push_back(p);
+        in_radius_d.push_back(dist(p, q));
+      }
+    }
+    tree.radiusSearch(q, 8.0f, res, d, opts);
+    if (hits(res, d) != hits(in_radius, in_radius_d)) return false;
+    typename Tree::AABB box({q.x - 6, q.y - 6, q.z - 6}, {q.x + 6, q.y + 6, q.z + 6});
+    Points in_box;
+    for (const auto& p : live)
+      if (box.contains(p)) in_box.push_back(p);
+    tree.boxSearch(box, res, opts);
+    if (hits(res, {}) != hits(in_box, {})) return false;
+  }
+  Points nn;
+  std::vector<float> nn_d;
+  tree.nearestNeighbors(queries, nn, nn_d, opts);
+  std::vector<Points> knn;
+  std::vector<std::vector<float>> knn_d;
+  tree.knnSearch(queries, 5, knn, knn_d, opts);
+  for (size_t i = 0; i < queries.size(); ++i) {
+    float expected = live.empty() ? INFINITY : bruteNearest(live, queries[i]);
+    if (!(nn_d[i] == expected || std::fabs(nn_d[i] - expected) <= 1e-4f))
+      return false;
+    if (!sameDistances(knn_d[i], bruteKnn(live, queries[i], 5))) return false;
+  }
+  return true;
+}
+
+// Random stamped writes, many of them duplicates, and queries that leave out
+// points stamped before a random min_stamp. A point delete takes the copy
+// with the oldest stamp.
+template <typename Tree>
+void testStampQueries() {
+  std::printf("[queries by stamp]\n");
+  using Stamp = typename Tree::Stamp;
+  std::mt19937 rng(23);
+  std::uniform_real_distribution<float> u(-50.0f, 50.0f);
+  std::vector<StampedPt> model;
+  auto record = [&](const Points& pts, uint32_t stamp) {
+    for (const auto& p : pts) model.push_back({p, stamp});
+  };
+  Tree tree;
+  Points first = gridBlob(rng, 2000);
+  tree.build(first, Stamp{1});
+  record(first, 1);
+  uint32_t now = 1;
+  for (int round = 0; round < 300; ++round) {
+    int kind = rng() % 10;
+    if (kind < 5) {
+      Points b = gridBlob(rng, 50 + rng() % 400);
+      if (kind == 0) {
+        tree.addPoints(b);
+        record(b, Stamp::kNever);
+      } else {
+        now += 1 + rng() % 3;
+        tree.addPoints(b, Stamp{now});
+        record(b, now);
+      }
+    } else if (kind < 8) {
+      Points del;
+      for (int i = 0; i < 100 && !model.empty(); ++i)
+        del.push_back(model[rng() % model.size()].p);
+      tree.deletePoints(del);
+      for (const auto& p : del) eraseOldest(model, p);
+    } else {
+      float cx = u(rng), cy = u(rng), h = 2.0f + rng() % 15;
+      typename Tree::AABB box({cx - h, cy - h, -100.0f}, {cx + h, cy + h, 100.0f});
+      tree.deleteBox(box);
+      model.erase(std::remove_if(model.begin(), model.end(),
+                                 [&](const StampedPt& e) { return box.contains(e.p); }),
+                  model.end());
+    }
+    if (round % 15 == 14) {
+      tree.waitForRebuild();
+      CHECK(tree.validate());
+      CHECK(storedStamps(tree) == entriesOf(model));
+      for (uint32_t min_stamp :
+           {0u, 1u, now / 2, now - now / 4, now, now + 1, Stamp::kNever})
+        CHECK(sameAsStampedModel(tree, model, min_stamp, rng));
+    }
+  }
+}
+
 // N is the tree's leaf size
 template <typename Tree, int N>
 void bruteForceTests(const char* label) {
@@ -999,6 +1137,7 @@ template <typename Tree>
 void stampTests(const char* label) {
   std::printf("== stamps, %s\n", label);
   testStampsFollowPoints<Tree>();
+  testStampQueries<Tree>();
 }
 
 template <typename Tree>
