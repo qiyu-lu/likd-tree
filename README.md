@@ -3,7 +3,6 @@
 **A Lightweight Incremental KD-Tree for Robotic Applications**
 
 [![C++](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
-[![PyPI version](https://img.shields.io/pypi/v/likd-tree.svg)](https://pypi.org/project/likd-tree/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 `likd-tree` is a lightweight incremental KD-tree designed for dynamic point insertion with automatic rebalancing.
@@ -25,6 +24,10 @@ To the best of our knowledge, this is the **first Python KD-tree library that su
 pip install likd-tree
 ```
 For details see [Python Usage](#python-usage)
+
+> **Note:** the `likd-tree` package on PyPI is the original author's 1.0.2
+> release, and the bindings in `python/` still build that version. Neither
+> includes the C++ changes in this repository yet.
 
 ## 🚀 Key Features
 
@@ -214,7 +217,7 @@ print(f"Tree size: {tree.size()}")
 ### Run Demo
 
 ```bash
-git clone https://github.com/scomup/likd-tree.git
+git clone https://github.com/qiyu-lu/likd-tree.git
 cd likd-tree
 cmake -B build
 cmake --build build
@@ -324,7 +327,7 @@ mixes of insertion and deletion, and exercise concurrent readers and writers.
 ### Run Benchmark (Compare with ikd-tree)
 
 ```bash
-git clone https://github.com/scomup/likd-tree.git
+git clone https://github.com/qiyu-lu/likd-tree.git
 cd likd-tree
 cmake -B build -DBUILD_BENCHMARK=ON
 cmake --build build

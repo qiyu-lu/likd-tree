@@ -12,6 +12,9 @@ license = {text = "MIT"}
 authors = [
     {name = "Liu Yang"}
 ]
+maintainers = [
+    {name = "qiyu-lu"}
+]
 keywords = ["kd-tree", "kdtree", "spatial-index", "nearest-neighbor", "point-cloud"]
 dependencies = [
     "pybind11>=2.6.0",
@@ -35,10 +38,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/scomup/likd-tree"
-Documentation = "https://github.com/scomup/likd-tree#readme"
-Repository = "https://github.com/scomup/likd-tree.git"
-"Bug Tracker" = "https://github.com/scomup/likd-tree/issues"
+Homepage = "https://github.com/qiyu-lu/likd-tree"
+Documentation = "https://github.com/qiyu-lu/likd-tree#readme"
+Repository = "https://github.com/qiyu-lu/likd-tree.git"
+"Bug Tracker" = "https://github.com/qiyu-lu/likd-tree/issues"
 
 [project.optional-dependencies]
 dev = ["numpy>=1.19.0"]

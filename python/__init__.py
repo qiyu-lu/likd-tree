@@ -24,7 +24,7 @@ Basic usage:
     
     print(f"Tree size: {tree.size()}")
 
-For more information, see: https://github.com/scomup/likd-tree
+For more information, see: https://github.com/qiyu-lu/likd-tree
 """
 
 __version__ = '1.0.2'

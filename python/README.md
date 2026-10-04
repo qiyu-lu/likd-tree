@@ -128,7 +128,7 @@ print(f"Tree size: {tree.size()}")
 ### Run Demo
 
 ```bash
-git clone https://github.com/scomup/likd-tree.git
+git clone https://github.com/qiyu-lu/likd-tree.git
 cd likd-tree
 cmake -B build
 cmake --build build
@@ -138,7 +138,7 @@ cmake --build build
 ### Run Benchmark (Compare with ikd-tree)
 
 ```bash
-git clone https://github.com/scomup/likd-tree.git
+git clone https://github.com/qiyu-lu/likd-tree.git
 cd likd-tree
 cmake -B build -DBUILD_BENCHMARK=ON
 cmake --build build
