@@ -1,218 +1,284 @@
-// test_kdtree.cpp
-// likd-tree vs ikd-tree benchmark
+// benchmark.cpp - likd-tree vs ikd-tree
+//
+// Both trees answer the same queries with the same threading: sequential
+// loops, or TBB parallel loops for both. Usage:
+//   ./benchmark            100K uniform random points, 1000-point frames
+//   ./benchmark map.pcd    stream a real map in file order, 2000-point frames,
+//                          plus a local-map test with box deletion
 
 // Enable TBB parallel execution (define before including likd_tree.hpp)
 #define LIKD_TREE_USE_TBB
 
+#include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
+#include <tbb/parallel_for.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "../src/likd_tree.hpp"
 #include "ikd_Tree.h"
 
-
 using PointType = pcl::PointXYZ;
+using LikdTree = KDTree<PointType>;
+using IkdTree = KD_TREE<PointType>;
+using Clock = std::chrono::steady_clock;
 
-void bruteForceNN(const PointVector<PointType>& pts,
-                  const PointType& query,
-                  const PointType*& best_pt,
-                  float& best_dist2) {
-  best_dist2 = std::numeric_limits<float>::max();
-  best_pt = nullptr;
-  for (const auto& p : pts) {
-    float dx = p.x - query.x;
-    float dy = p.y - query.y;
-    float dz = p.z - query.z;
-    float d2 = dx * dx + dy * dy + dz * dz;
-    if (d2 < best_dist2) {
-      best_dist2 = d2;
-      best_pt = &p;
+namespace {
+
+constexpr int K = 5;  // FAST-LIO matches each point against 5 neighbors
+
+double elapsedMs(Clock::time_point a, Clock::time_point b) {
+  return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+std::vector<float> likdNN(const LikdTree& tree, const PointVector<PointType>& qs) {
+  std::vector<float> d(qs.size());
+  for (size_t i = 0; i < qs.size(); ++i) d[i] = tree.nearestNeighbors(qs[i]).second;
+  return d;
+}
+
+// Distance to the k-th neighbor (or the farthest found) for each query
+std::vector<float> likdKnn(const LikdTree& tree, const PointVector<PointType>& qs,
+                           int k, bool parallel) {
+  std::vector<float> kth(qs.size(), INFINITY);
+  auto one = [&](size_t i) {
+    PointVector<PointType> res;
+    std::vector<float> d;
+    tree.knnSearch(qs[i], k, res, d);
+    if (!d.empty()) kth[i] = d.back();
+  };
+  if (parallel)
+    tbb::parallel_for(size_t(0), qs.size(), one);
+  else
+    for (size_t i = 0; i < qs.size(); ++i) one(i);
+  return kth;
+}
+
+std::vector<float> ikdKnn(IkdTree& tree, const PointVector<PointType>& qs, int k,
+                          bool parallel) {
+  std::vector<float> kth(qs.size(), INFINITY);
+  auto one = [&](size_t i) {
+    PointVector<PointType> res;
+    std::vector<float> d;
+    tree.Nearest_Search(qs[i], k, res, d);
+    if (!d.empty()) kth[i] = std::sqrt(d.back());  // ikd returns squared
+  };
+  if (parallel)
+    tbb::parallel_for(size_t(0), qs.size(), one);
+  else
+    for (size_t i = 0; i < qs.size(); ++i) one(i);
+  return kth;
+}
+
+struct Totals {
+  double build = 0, insert = 0, insert_max = 0, nn = 0, knn = 0, knn_par = 0,
+         del = 0;
+};
+
+void printRow(const char* name, double likd, double ikd) {
+  printf("  %-28s likd-tree %9.2f ms | ikd-tree %9.2f ms | %5.2fx\n", name, likd,
+         ikd, ikd / likd);
+}
+
+// Feed `pts` frame by frame: query the frame against the map, then insert it.
+// With local_map_half > 0, every 10 frames delete everything outside a cube
+// around the frame centroid (like FAST-LIO's map segmentation).
+void runStream(const PointVector<PointType>& pts, size_t frame,
+               float local_map_half) {
+  LikdTree likd;
+  IkdTree* ikd = new IkdTree();  // ~48 MB operation queue: keep off the stack
+  Totals L, I;
+  long stale = 0, total = 0;
+
+  PointVector<PointType> first(pts.begin(), pts.begin() + frame);
+  auto t0 = Clock::now();
+  likd.build(first);
+  auto t1 = Clock::now();
+  ikd->Build(first);
+  auto t2 = Clock::now();
+  L.build = elapsedMs(t0, t1);
+  I.build = elapsedMs(t1, t2);
+
+  size_t frames = 0;
+  for (size_t s = frame; s < pts.size(); s += frame, ++frames) {
+    PointVector<PointType> batch(pts.begin() + s,
+                                 pts.begin() + std::min(s + frame, pts.size()));
+    // Query phase (scan matching against the current map)
+    auto q0 = Clock::now();
+    likdNN(likd, batch);
+    auto q1 = Clock::now();
+    ikdKnn(*ikd, batch, 1, false);
+    auto q2 = Clock::now();
+    std::vector<float> lk = likdKnn(likd, batch, K, false);
+    auto q3 = Clock::now();
+    std::vector<float> ik = ikdKnn(*ikd, batch, K, false);
+    auto q4 = Clock::now();
+    likdKnn(likd, batch, K, true);
+    auto q5 = Clock::now();
+    ikdKnn(*ikd, batch, K, true);
+    auto q6 = Clock::now();
+    L.nn += elapsedMs(q0, q1);
+    I.nn += elapsedMs(q1, q2);
+    L.knn += elapsedMs(q2, q3);
+    I.knn += elapsedMs(q3, q4);
+    L.knn_par += elapsedMs(q4, q5);
+    I.knn_par += elapsedMs(q5, q6);
+    // ikd-tree applies every write immediately: a different k-th distance
+    // means likd-tree answered from a map without its queued writes
+    for (size_t i = 0; i < batch.size(); ++i, ++total)
+      stale += std::fabs(lk[i] - ik[i]) > 1e-3f;
+
+    // Insert phase
+    auto a0 = Clock::now();
+    likd.addPoints(batch);
+    auto a1 = Clock::now();
+    ikd->Add_Points(batch, false);
+    auto a2 = Clock::now();
+    L.insert += elapsedMs(a0, a1);
+    I.insert += elapsedMs(a1, a2);
+    L.insert_max = std::max(L.insert_max, elapsedMs(a0, a1));
+    I.insert_max = std::max(I.insert_max, elapsedMs(a1, a2));
+
+    if (local_map_half > 0 && frames % 10 == 9) {
+      float c[3] = {0, 0, 0};
+      for (const auto& p : batch) {
+        c[0] += p.x / batch.size();
+        c[1] += p.y / batch.size();
+        c[2] += p.z / batch.size();
+      }
+      std::vector<LikdTree::AABB> boxes;
+      std::vector<BoxPointType> ikd_boxes;
+      for (int axis = 0; axis < 3; ++axis) {
+        for (int side = 0; side < 2; ++side) {
+          LikdTree::AABB box({-1e6f, -1e6f, -1e6f}, {1e6f, 1e6f, 1e6f});
+          if (side == 0)
+            box.max[axis] = c[axis] - local_map_half;
+          else
+            box.min[axis] = c[axis] + local_map_half;
+          boxes.push_back(box);
+          BoxPointType b;
+          for (int i = 0; i < 3; ++i) {
+            b.vertex_min[i] = box.min[i];
+            b.vertex_max[i] = box.max[i];
+          }
+          ikd_boxes.push_back(b);
+        }
+      }
+      auto d0 = Clock::now();
+      likd.deleteBoxes(boxes);
+      auto d1 = Clock::now();
+      ikd->Delete_Point_Boxes(ikd_boxes);
+      auto d2 = Clock::now();
+      L.del += elapsedMs(d0, d1);
+      I.del += elapsedMs(d1, d2);
     }
   }
-}
+  auto w0 = Clock::now();
+  likd.waitForRebuild();
+  double wait_ms = elapsedMs(w0, Clock::now());
 
-void queryMyKDtree(const KDTree<PointType>& tree,
-                   const PointVector<PointType>& pts,
-                   int num_points
-) {
-
-  const int Q = num_points;
-  // Only query the first Q points, not all points!
-  PointVector<PointType> queries(pts.begin(), pts.begin() + Q);
-  PointVector<PointType> nn_pts;
-  std::vector<float> nn_dists;
-  tree.nearestNeighbors(queries, nn_pts, nn_dists);
-
-}
-
-void queryIKD(KD_TREE<PointType>* ikd,
-                     const PointVector<PointType>& pts,
-                     int num_points) {
-  const int Q = num_points;
-  for (int i = 0; i < Q; ++i) {
-    PointType q = pts[i];
-    PointVector<PointType> ikd_nn_pts;
-    std::vector<float> ikd_nn_dists;
-    ikd->Nearest_Search(q, 1, ikd_nn_pts, ikd_nn_dists);
+  printf("  frames: %zu x %zu points\n", frames, frame);
+  printRow("Build (first frame)", L.build, I.build);
+  printRow("Insert total", L.insert, I.insert);
+  printRow("Insert worst frame", L.insert_max, I.insert_max);
+  printRow("1-NN query total (seq)", L.nn, I.nn);
+  printRow("5-NN query total (seq)", L.knn, I.knn);
+  printRow("5-NN query total (TBB)", L.knn_par, I.knn_par);
+  if (local_map_half > 0) {
+    printRow("Box delete total", L.del, I.del);
+    printf("  %-28s likd-tree %9d    | ikd-tree %9d\n", "Points kept", likd.size(),
+           ikd->validnum());
+    printf("  %-28s likd-tree %9d    | ikd-tree %9d\n", "Nodes held",
+           likd.nodeCount(), ikd->size());
   }
+  printf("  likd-tree final wait for rebuild: %.2f ms\n", wait_ms);
+  printf("  5-NN answers from a map with queued writes (likd-tree): %.3f%%\n",
+         100.0 * stale / total);
+  delete ikd;
 }
 
-int main() {
-  // Generate 1 million random points
-  const size_t total_points = 100000;
-  const int batch_size = 1000;
-  
-  std::cout << "Generating " << total_points << " random points..." << std::endl;
-  
+}  // namespace
+
+int main(int argc, char** argv) {
   PointVector<PointType> pts;
-  pts.reserve(total_points);
-  
-  std::mt19937 rng(12345);
-  std::uniform_real_distribution<float> dist(-100.0f, 100.0f);
-  
-  for (size_t i = 0; i < total_points; ++i) {
-    PointType pt;
-    pt.x = dist(rng);
-    pt.y = dist(rng);
-    pt.z = dist(rng);
-    pts.push_back(pt);
+  size_t frame;
+  if (argc > 1) {
+    pcl::PointCloud<PointType> cloud;
+    if (pcl::io::loadPCDFile<PointType>(argv[1], cloud) < 0) {
+      std::cerr << "Failed to read " << argv[1] << std::endl;
+      return 1;
+    }
+    for (const auto& p : cloud.points)
+      if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
+        pts.push_back(p);
+    frame = 2000;
+    std::cout << "Map " << argv[1] << ": " << pts.size() << " points\n";
+  } else {
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> dist(-100.0f, 100.0f);
+    pts.resize(100000);
+    for (auto& p : pts) {
+      p.x = dist(rng);
+      p.y = dist(rng);
+      p.z = dist(rng);
+    }
+    frame = 1000;
+    std::cout << "100K uniform random points in [-100, 100]^3\n";
   }
-  
-  using clock = std::chrono::high_resolution_clock;
-  
+
   // ============================================================
   // Part 1: Batch Build Test (Build all points at once)
   // ============================================================
-  std::cout << "\n=== Part 1: Batch Build Test ===" << std::endl;
-  std::cout << "Building trees with all " << total_points << " points at once..." << std::endl;
-  
-  KDTree<PointType> tree_batch;
-  KD_TREE<PointType>* ikd_batch = new KD_TREE<PointType>();
-  
-  auto t0 = clock::now();
-  tree_batch.build(pts);
-  auto t1 = clock::now();
-  
-  ikd_batch->Build(pts);
-  auto t2 = clock::now();
-  
-  double likd_build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-  double ikd_build_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-  
-  printf("Batch build time: likd-tree %.2f ms, ikd-tree %.2f ms\n", likd_build_ms, ikd_build_ms);
-  
-  // Query test after batch build
-  queryMyKDtree(tree_batch, pts, 1000);
-  auto t3 = clock::now();
-  
-  queryIKD(ikd_batch, pts, 1000);
-  auto t4 = clock::now();
-  
-  double likd_query_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
-  double ikd_query_ms = std::chrono::duration<double, std::milli>(t4 - t3).count();
-  
-  printf("Query time (1000 queries): likd-tree %.2f ms, ikd-tree %.2f ms\n", likd_query_ms, ikd_query_ms);
-  
-  delete ikd_batch;
-  
+  std::cout << "\n=== Part 1: Batch build + 1000 queries ===" << std::endl;
+  {
+    LikdTree likd;
+    IkdTree* ikd = new IkdTree();
+    auto t0 = Clock::now();
+    likd.build(pts);
+    auto t1 = Clock::now();
+    ikd->Build(pts);
+    auto t2 = Clock::now();
+    std::mt19937 rng(7);
+    std::normal_distribution<float> noise(0.0f, 0.05f);
+    PointVector<PointType> queries(1000);
+    for (size_t i = 0; i < queries.size(); ++i) {
+      queries[i] = pts[(i * 7919) % pts.size()];
+      queries[i].x += noise(rng);
+      queries[i].y += noise(rng);
+      queries[i].z += noise(rng);
+    }
+    auto q0 = Clock::now();
+    likdNN(likd, queries);
+    auto q1 = Clock::now();
+    ikdKnn(*ikd, queries, 1, false);
+    auto q2 = Clock::now();
+    likdKnn(likd, queries, K, false);
+    auto q3 = Clock::now();
+    ikdKnn(*ikd, queries, K, false);
+    auto q4 = Clock::now();
+    printRow("Build", elapsedMs(t0, t1), elapsedMs(t1, t2));
+    printRow("1-NN x1000 (seq)", elapsedMs(q0, q1), elapsedMs(q1, q2));
+    printRow("5-NN x1000 (seq)", elapsedMs(q2, q3), elapsedMs(q3, q4));
+    delete ikd;
+  }
+
   // ============================================================
   // Part 2: Incremental Insertion Test
   // ============================================================
-  std::cout << "\n=== Part 2: Incremental Insertion Test ===" << std::endl;
-  std::cout << "Inserting points in batches of " << batch_size << "..." << std::endl;
-  
-  KDTree<PointType> tree_incr;
-  KD_TREE<PointType>* ikd_incr = new KD_TREE<PointType>();
-  
-  double likd_incr_total_insert = 0.0;
-  double ikd_incr_total_insert = 0.0;
-  double likd_incr_total_query = 0.0;
-  double ikd_incr_total_query = 0.0;
-  int num_iterations = 0;
-  
-  for (size_t start = 0; start < pts.size(); start += batch_size) {
-    size_t end = std::min(start + batch_size, pts.size());
-    PointVector<PointType> batch(pts.begin() + start, pts.begin() + end);
-    
-    auto t0 = clock::now();
-    if (start == 0) {
-      tree_incr.build(batch);
-    } else {
-      tree_incr.addPoints(batch);
-    }
-    auto t1 = clock::now();
+  std::cout << "\n=== Part 2: Incremental insertion (query, then insert) ==="
+            << std::endl;
+  runStream(pts, frame, 0.0f);
 
-    if (start == 0) {
-      ikd_incr->Build(batch);
-    } else {
-      ikd_incr->Add_Points(batch, false);
-    }
-    auto t2 = clock::now();
-
-    queryMyKDtree(tree_incr, pts, 1000);
-    auto t3 = clock::now();
-    
-    queryIKD(ikd_incr, pts, 1000);
-    auto t4 = clock::now();
-
-    double mkd_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    double ikd_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-    double mkd_query_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
-    double ikd_query_ms = std::chrono::duration<double, std::milli>(t4 - t3).count();
-    
-    likd_incr_total_insert += mkd_ms;
-    ikd_incr_total_insert += ikd_ms;
-    likd_incr_total_query += mkd_query_ms;
-    ikd_incr_total_query += ikd_query_ms;
-    num_iterations++;
-    
-    printf("Inserted: %zu / %zu, insert: likd %.2f ms, ikd %.2f ms, query: likd %.2f ms, ikd %.2f ms\n", 
-           end, pts.size(), mkd_ms, ikd_ms, mkd_query_ms, ikd_query_ms);
+  if (argc > 1) {
+    std::cout << "\n=== Part 3: Local map, 100 m cube, box delete every 10 "
+                 "frames ===" << std::endl;
+    runStream(pts, frame, 50.0f);
   }
-  
-  delete ikd_incr;
-  
-  // ============================================================
-  // Final Comparison Report
-  // ============================================================
-  std::cout << "\n" << std::string(70, '=') << std::endl;
-  std::cout << "                    FINAL COMPARISON REPORT" << std::endl;
-  std::cout << std::string(70, '=') << std::endl;
-  std::cout << "Total points: " << total_points << std::endl;
-  std::cout << std::string(70, '-') << std::endl;
-  
-  std::cout << "\n[Part 1] Batch Build Performance:" << std::endl;
-  printf("  Build Time:        likd-tree %8.2f ms  |  ikd-tree %8.2f ms  |  Ratio: %.2fx\n", 
-         likd_build_ms, ikd_build_ms, ikd_build_ms / likd_build_ms);
-  printf("  Query Time (1000): likd-tree %8.2f ms  |  ikd-tree %8.2f ms  |  Ratio: %.2fx\n", 
-         likd_query_ms, ikd_query_ms, ikd_query_ms / likd_query_ms);
-  
-  std::cout << "\n[Part 2] Incremental Insertion Performance:" << std::endl;
-  printf("  Total Insert Time: likd-tree %8.2f ms  |  ikd-tree %8.2f ms  |  Ratio: %.2fx\n", 
-         likd_incr_total_insert, ikd_incr_total_insert, ikd_incr_total_insert / likd_incr_total_insert);
-  printf("  Avg Insert/Batch:  likd-tree %8.2f ms  |  ikd-tree %8.2f ms  |  Ratio: %.2fx\n", 
-         likd_incr_total_insert / num_iterations, ikd_incr_total_insert / num_iterations,
-         (ikd_incr_total_insert / num_iterations) / (likd_incr_total_insert / num_iterations));
-  printf("  Total Query Time:  likd-tree %8.2f ms  |  ikd-tree %8.2f ms  |  Ratio: %.2fx\n", 
-         likd_incr_total_query, ikd_incr_total_query, ikd_incr_total_query / likd_incr_total_query);
-  printf("  Avg Query/Batch:   likd-tree %8.2f ms  |  ikd-tree %8.2f ms  |  Ratio: %.2fx\n", 
-         likd_incr_total_query / num_iterations, ikd_incr_total_query / num_iterations,
-         (ikd_incr_total_query / num_iterations) / (likd_incr_total_query / num_iterations));
-  
-  std::cout << "\n[Summary] Overall Winner:" << std::endl;
-  double likd_total = likd_build_ms + likd_query_ms + likd_incr_total_insert + likd_incr_total_query;
-  double ikd_total = ikd_build_ms + ikd_query_ms + ikd_incr_total_insert + ikd_incr_total_query;
-  printf("  Total Time:        likd-tree %8.2f ms  |  ikd-tree %8.2f ms\n", likd_total, ikd_total);
-  if (likd_total < ikd_total) {
-    printf("  🏆 likd-tree is %.2fx FASTER overall!\n", ikd_total / likd_total);
-  } else {
-    printf("  🏆 ikd-tree is %.2fx faster overall.\n", likd_total / ikd_total);
-  }
-  
-  std::cout << std::string(70, '=') << std::endl;
   return 0;
 }
