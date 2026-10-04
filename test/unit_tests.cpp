@@ -2,7 +2,8 @@
 // Every query is checked against brute force. Returns non-zero on failure.
 // The brute-force tests run for leaf sizes 2, 4, 32 (the default) and 64:
 // small leaves split and rebuild often. The concurrency tests run for leaf
-// sizes 2 and 32.
+// sizes 2 and 32. Trees that keep stamps (TRACK_STAMPS) run the brute-force
+// tests and the stamp tests for leaf sizes 2 and 32.
 
 #include <algorithm>
 #include <array>
@@ -40,6 +41,14 @@ struct LeafOptions : DefaultOptions {
 };
 template <int N>
 using LeafTree = KDTree<Pt, PointTraits<Pt>, LeafOptions<N>>;
+
+template <int N>
+struct StampOptions : DefaultOptions {
+  static constexpr int LEAF_SIZE = N;
+  static constexpr bool TRACK_STAMPS = true;
+};
+template <int N>
+using StampTree = KDTree<Pt, PointTraits<Pt>, StampOptions<N>>;
 
 int g_failures = 0;
 
@@ -878,6 +887,94 @@ void testReadersDuringWritesAndBuild() {
   CHECK(matchesBruteForce(tree, last, rng, 100));
 }
 
+// A point's coordinates and stamp
+using StampedEntry = std::pair<std::array<float, 3>, uint32_t>;
+
+template <typename Tree>
+std::vector<StampedEntry> storedStamps(const Tree& tree) {
+  std::vector<StampedEntry> out;
+  for (const auto& [p, stamp] : tree.stampedPoints())
+    out.push_back({{p.x, p.y, p.z}, stamp});
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// Each point keeps the stamp it was written with through splits, compaction
+// and rebuilds, and writes queued during a rebuild carry theirs. Points
+// written without a stamp get kNever.
+template <typename Tree>
+void testStampsFollowPoints() {
+  std::printf("[stamps follow points]\n");
+  using Stamp = typename Tree::Stamp;
+  std::mt19937 rng(22);
+  std::uniform_real_distribution<float> u(-50.0f, 50.0f);
+  std::vector<StampedEntry> model;
+  auto record = [&](const Points& pts, uint32_t stamp) {
+    for (const auto& p : pts) model.push_back({{p.x, p.y, p.z}, stamp});
+  };
+  Tree tree;
+  auto matches = [&] {
+    std::vector<StampedEntry> expected = model;
+    std::sort(expected.begin(), expected.end());
+    return storedStamps(tree) == expected;
+  };
+  Points first = blob(rng, 3000, 10.0f);
+  tree.build(first, Stamp{7});
+  record(first, 7);
+  CHECK(tree.validate());
+  CHECK(matches());
+  // Without waiting, so that many writes go through the queue
+  for (int round = 0; round < 300; ++round) {
+    int kind = rng() % 10;
+    if (kind < 6) {
+      // Random coordinates do not repeat, so the deletes below are exact
+      Points b = blob(rng, 50 + rng() % 500);
+      if (kind == 0) {
+        tree.addPoints(b);
+        record(b, Stamp::kNever);
+      } else {
+        uint32_t stamp = 10 + rng() % 1000;
+        tree.addPoints(b, Stamp{stamp});
+        record(b, stamp);
+      }
+    } else if (kind < 8) {
+      Points del;
+      for (int i = 0; i < 100 && !model.empty(); ++i) {
+        size_t j = rng() % model.size();
+        del.push_back({model[j].first[0], model[j].first[1], model[j].first[2]});
+        model[j] = model.back();
+        model.pop_back();
+      }
+      tree.deletePoints(del);
+    } else {
+      float cx = u(rng), cy = u(rng), h = 2.0f + rng() % 15;
+      typename Tree::AABB box({cx - h, cy - h, -100.0f}, {cx + h, cy + h, 100.0f});
+      tree.deleteBox(box);
+      model.erase(std::remove_if(model.begin(), model.end(),
+                                 [&](const StampedEntry& e) {
+                                   const auto& c = e.first;
+                                   return box.contains(Pt{c[0], c[1], c[2]});
+                                 }),
+                  model.end());
+    }
+    if (round % 10 == 9) {
+      tree.waitForRebuild();
+      CHECK(tree.validate());
+      CHECK(matches());
+    }
+  }
+  tree.waitForRebuild();
+  CHECK(tree.validate());
+  CHECK(matches());
+  Tree plain;
+  plain.build(first);
+  std::vector<StampedEntry> stored = storedStamps(plain);
+  CHECK(stored.size() == first.size() &&
+        std::all_of(stored.begin(), stored.end(), [](const StampedEntry& e) {
+          return e.second == Stamp::kNever;
+        }));
+}
+
 // N is the tree's leaf size
 template <typename Tree, int N>
 void bruteForceTests(const char* label) {
@@ -896,6 +993,12 @@ void bruteForceTests(const char* label) {
   testValidatedRandomWrites<Tree>();
   testReuseDeletedSlot<Tree, N>();
   testWriteOrderAcrossChunks<Tree>();
+}
+
+template <typename Tree>
+void stampTests(const char* label) {
+  std::printf("== stamps, %s\n", label);
+  testStampsFollowPoints<Tree>();
 }
 
 template <typename Tree>
@@ -920,6 +1023,10 @@ int main() {
   bruteForceTests<LeafTree<4>, 4>("leaf size 4");
   bruteForceTests<KDTree<Pt>, DefaultOptions::LEAF_SIZE>("default leaf size (32)");
   bruteForceTests<LeafTree<64>, 64>("leaf size 64");
+  bruteForceTests<StampTree<2>, 2>("leaf size 2, stamps");
+  bruteForceTests<StampTree<32>, 32>("default leaf size (32), stamps");
+  stampTests<StampTree<2>>("leaf size 2");
+  stampTests<StampTree<32>>("default leaf size (32)");
   concurrencyTests<LeafTree<2>>("leaf size 2");
   concurrencyTests<KDTree<Pt>>("default leaf size (32)");
   if (g_failures) {

@@ -78,6 +78,9 @@ using PointVector = std::vector<PointType, Eigen::aligned_allocator<PointType>>;
 struct DefaultOptions {
   // Points stored in each leaf, 2 to 64
   static constexpr int LEAF_SIZE = 32;
+  // Keep a stamp per point (see KDTree::Stamp). Off, the tree has the same
+  // layout and speed as without the option.
+  static constexpr bool TRACK_STAMPS = false;
 };
 
 // PointType must be default-constructible and copy-assignable.
@@ -86,6 +89,7 @@ template <typename PointType, typename Traits = PointTraits<PointType>,
 class KDTree {
   static constexpr int LeafSize = Options::LEAF_SIZE;
   static_assert(LeafSize >= 2 && LeafSize <= 64, "LEAF_SIZE must be 2 to 64");
+  static constexpr bool TrackStamps = Options::TRACK_STAMPS;
   // Smaller subtrees are never rebuilt: a few leaves are not worth it
   static constexpr int MIN_REBUILD_SIZE = 4 * LeafSize;
   // Points per leaf when building: ceil(0.8 * LeafSize), leaving room to
@@ -116,11 +120,24 @@ class KDTree {
     bool sorted = true;
   };
 
+  // A point's stamp, kept with Options::TRACK_STAMPS: a frame number or a
+  // time, in any unit that never decreases and does not wrap. kNever, the
+  // largest value, means the point never expires; writes without a stamp
+  // give their points this value.
+  struct Stamp {
+    static constexpr uint32_t kNever = std::numeric_limits<uint32_t>::max();
+    uint32_t value = 0;
+  };
+
   KDTree();
   ~KDTree();
 
   void build(const PointVector<PointType>& pts);
   void addPoints(const PointVector<PointType>& pts, bool wait_for_rebuild = false);
+  // With Options::TRACK_STAMPS only: the points get `stamp`.
+  void build(const PointVector<PointType>& pts, Stamp stamp);
+  void addPoints(const PointVector<PointType>& pts, Stamp stamp,
+                 bool wait_for_rebuild = false);
   // Deletes one stored copy of each point whose coordinates match exactly.
   void deletePoints(const PointVector<PointType>& pts,
                     bool wait_for_rebuild = false);
@@ -207,12 +224,24 @@ class KDTree {
   // recomputed from scratch. Call it while no rebuild runs, e.g. after
   // waitForRebuild().
   bool validate() const;
+  // With Options::TRACK_STAMPS: every point not deleted, with its stamp
+  std::vector<std::pair<PointType, uint32_t>> stampedPoints() const;
 #endif
 
  private:
   using Mask = std::conditional_t<(LeafSize <= 32), uint32_t, uint64_t>;
 
-  struct Node {
+  // Without stamps the bases below are empty and take no space, so nodes and
+  // queued writes keep their layout. Each empty base is a distinct type: two
+  // empty bases of one type could not share an address.
+  struct NoStampBounds {};
+  // The stamps of the non-deleted points below a node; [kNever, 0] if none
+  struct StampBounds {
+    uint32_t t_min = Stamp::kNever;
+    uint32_t t_max = 0;
+  };
+
+  struct Node : std::conditional_t<TrackStamps, StampBounds, NoStampBounds> {
     Node* parent = nullptr;
     AABB aabb;  // bounds of the non-deleted points in this subtree
     int size = 0;   // points stored in this subtree, deleted ones included
@@ -241,6 +270,26 @@ class KDTree {
     Leaf() : Node(true) {}
   };
 
+  // The leaf allocated with stamps. They follow the points, so the fields a
+  // query reads keep the offsets they have without stamps.
+  struct StampedLeaf : Leaf {
+    uint32_t stamps[LeafSize];  // stamps[i] belongs to pts[i]
+  };
+  using AllocatedLeaf = std::conditional_t<TrackStamps, StampedLeaf, Leaf>;
+
+  // A stamp passed down to the code that stores it: nothing without stamps
+  struct NoStampArg {};
+  using StampArg = std::conditional_t<TrackStamps, uint32_t, NoStampArg>;
+
+  // What a build sorts and a rebuild collects: the points, with their stamps
+  // if the tree keeps them
+  struct StampedPoint {
+    PointType pt;
+    uint32_t stamp;
+  };
+  using Item = std::conditional_t<TrackStamps, StampedPoint, PointType>;
+  using ItemVector = std::vector<Item, Eigen::aligned_allocator<Item>>;
+
   // std::shared_mutex on glibc prefers readers: back-to-back queries from
   // other threads could starve the writers and the rebuild swap forever.
   // New readers therefore wait while a writer is queued.
@@ -266,7 +315,11 @@ class KDTree {
 
   // A write queued while a rebuild runs
   enum class OpType { kInsert, kDeletePoint, kDeleteBox };
-  struct Op {
+  struct NoOpStamp {};
+  struct OpStamp {
+    uint32_t stamp;  // insert: the new point's stamp
+  };
+  struct Op : std::conditional_t<TrackStamps, OpStamp, NoOpStamp> {
     OpType type;
     PointType point;
     AABB box;
@@ -279,6 +332,21 @@ class KDTree {
   static const Inner* asInner(const Node* n) {
     return static_cast<const Inner*>(n);
   }
+  static uint32_t* stampsOf(Leaf* leaf) {
+    return static_cast<StampedLeaf*>(leaf)->stamps;
+  }
+  static const uint32_t* stampsOf(const Leaf* leaf) {
+    return static_cast<const StampedLeaf*>(leaf)->stamps;
+  }
+  static StampArg neverStamp();
+  static const PointType& pointOf(const Item& item);
+  static Item itemAt(const Leaf* leaf, int i);
+  // Puts n items in the first slots of the leaf and sets its size
+  static void storeItems(Leaf* leaf, const Item* items, int n);
+  static Op makeOp(OpType type, const PointType& point, const AABB& box,
+                   StampArg stamp);
+  static StampArg opStamp(const Op& op);
+  static void clearStampBounds(Node* node);
   static Mask bit(int i) { return Mask(1) << i; }
   // The lowest n bits; n may equal the width of Mask
   static Mask lowBits(int n) {
@@ -291,12 +359,15 @@ class KDTree {
 
   template <typename ApplyFn, typename OpFn>
   void write(size_t count, ApplyFn&& apply, OpFn&& to_op, bool wait_for_rebuild);
+  void buildFrom(const PointVector<PointType>& pts, StampArg stamp);
+  void insertPoints(const PointVector<PointType>& pts, StampArg stamp,
+                    bool wait_for_rebuild);
   void applyOp(const Op& op, std::vector<Node*>* candidates);
   Leaf* newLeaf();
   Inner* newInner(float split, int axis);
-  Node* insertInternal(Node* node, const PointType& pt,
+  Node* insertInternal(Node* node, const PointType& pt, StampArg stamp,
                        std::vector<Node*>* candidates);
-  static void appendPoint(Leaf* leaf, const PointType& pt);
+  static void appendPoint(Leaf* leaf, const PointType& pt, StampArg stamp);
   Node* makeRoom(Leaf* leaf);
   bool deletePointInternal(Node* node, const PointType& pt,
                            std::vector<Node*>* candidates);
@@ -309,9 +380,12 @@ class KDTree {
   static void updateInner(Inner* node);
   bool needRebuild(const Inner* node) const;
   void markIfUnbalanced(Inner* node, std::vector<Node*>* candidates);
-  void collect(const Node* node, PointVector<PointType>& pts) const;
+  // Appends the non-deleted points below node to out, a PointVector or an
+  // ItemVector
+  template <typename Vec>
+  void collect(const Node* node, Vec& out) const;
   void destroy(Node* node);
-  Node* buildRecursive(PointVector<PointType>& pts, size_t l, size_t r);
+  Node* buildRecursive(ItemVector& items, size_t l, size_t r);
   void nearestNeighborInternal(const Node* node, const PointType& query,
                                const PointType*& best_pt,
                                float& best_dist2) const;
@@ -449,11 +523,32 @@ KDTree<PointType, Traits, Options>::~KDTree() {
 
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::build(const PointVector<PointType>& pts) {
+  buildFrom(pts, neverStamp());
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::build(const PointVector<PointType>& pts,
+                                      Stamp stamp) {
+  static_assert(TrackStamps, "build() with a Stamp needs Options::TRACK_STAMPS");
+  if constexpr (TrackStamps)
+    buildFrom(pts, stamp.value);
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::buildFrom(const PointVector<PointType>& pts,
+                                          [[maybe_unused]] StampArg stamp) {
   std::lock_guard<std::mutex> write_lock(write_mutex_);
   // The worker may still hold pointers into the current tree
   waitForRebuild();
-  PointVector<PointType> tmp = pts;
-  Node* new_root = buildRecursive(tmp, 0, tmp.size());
+  ItemVector items;
+  if constexpr (TrackStamps) {
+    items.reserve(pts.size());
+    for (const auto& p : pts)
+      items.push_back({p, stamp});
+  } else {
+    items = pts;
+  }
+  Node* new_root = buildRecursive(items, 0, items.size());
   Node* old_root;
   {
     std::unique_lock<SharedMutex> lock(tree_mutex_);
@@ -536,12 +631,27 @@ void KDTree<PointType, Traits, Options>::write(size_t count, ApplyFn&& apply,
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::addPoints(const PointVector<PointType>& pts,
                                           bool wait_for_rebuild) {
+  insertPoints(pts, neverStamp(), wait_for_rebuild);
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::addPoints(const PointVector<PointType>& pts,
+                                          Stamp stamp, bool wait_for_rebuild) {
+  static_assert(TrackStamps,
+                "addPoints() with a Stamp needs Options::TRACK_STAMPS");
+  if constexpr (TrackStamps)
+    insertPoints(pts, stamp.value, wait_for_rebuild);
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::insertPoints(
+    const PointVector<PointType>& pts, StampArg stamp, bool wait_for_rebuild) {
   write(
       pts.size(),
       [&](size_t i, std::vector<Node*>* candidates) {
-        root_ = insertInternal(root_, pts[i], candidates);
+        root_ = insertInternal(root_, pts[i], stamp, candidates);
       },
-      [&](size_t i) { return Op{OpType::kInsert, pts[i], AABB()}; },
+      [&](size_t i) { return makeOp(OpType::kInsert, pts[i], AABB(), stamp); },
       wait_for_rebuild);
 }
 
@@ -553,7 +663,9 @@ void KDTree<PointType, Traits, Options>::deletePoints(const PointVector<PointTyp
       [&](size_t i, std::vector<Node*>* candidates) {
         deletePointInternal(root_, pts[i], candidates);
       },
-      [&](size_t i) { return Op{OpType::kDeletePoint, pts[i], AABB()}; },
+      [&](size_t i) {
+        return makeOp(OpType::kDeletePoint, pts[i], AABB(), neverStamp());
+      },
       wait_for_rebuild);
 }
 
@@ -565,7 +677,9 @@ void KDTree<PointType, Traits, Options>::deleteBoxes(const std::vector<AABB>& bo
       [&](size_t i, std::vector<Node*>* candidates) {
         deleteBoxInternal(root_, boxes[i], candidates);
       },
-      [&](size_t i) { return Op{OpType::kDeleteBox, PointType(), boxes[i]}; },
+      [&](size_t i) {
+        return makeOp(OpType::kDeleteBox, PointType(), boxes[i], neverStamp());
+      },
       wait_for_rebuild);
 }
 
@@ -791,7 +905,7 @@ int KDTree<PointType, Traits, Options>::nodeCount() const {
 
 template <typename PointType, typename Traits, typename Options>
 size_t KDTree<PointType, Traits, Options>::memoryUsage() const {
-  return leaf_count_.load(std::memory_order_relaxed) * sizeof(Leaf) +
+  return leaf_count_.load(std::memory_order_relaxed) * sizeof(AllocatedLeaf) +
          inner_count_.load(std::memory_order_relaxed) * sizeof(Inner);
 }
 
@@ -817,6 +931,15 @@ bool KDTree<PointType, Traits, Options>::validate() const {
   auto same_box = [](const AABB& a, const AABB& b) {
     return a.min == b.min && a.max == b.max;
   };
+  // Compares a node's stamp bounds with [t_min, t_max]; true without stamps
+  auto same_stamps = []([[maybe_unused]] const Node* n,
+                        [[maybe_unused]] uint32_t t_min,
+                        [[maybe_unused]] uint32_t t_max) {
+    if constexpr (TrackStamps)
+      return n->t_min == t_min && n->t_max == t_max;
+    else
+      return true;
+  };
   bool ok = !root_ || (root_->parent == nullptr && !root_->is_left_child);
   size_t leaves = 0, inners = 0;
   // (node, below a tree_deleted tag: its counts and bounds are stale)
@@ -837,11 +960,17 @@ bool KDTree<PointType, Traits, Options>::validate() const {
       if (!stale) {
         int valid = 0;
         AABB box;
+        uint32_t t_min = Stamp::kNever, t_max = 0;
         forEachValid(leaf, [&](int i) {
           ++valid;
           box.expand(leaf->pts[i]);
+          if constexpr (TrackStamps) {
+            t_min = std::min(t_min, stampsOf(leaf)[i]);
+            t_max = std::max(t_max, stampsOf(leaf)[i]);
+          }
         });
-        ok = ok && leaf->valid == valid && same_box(leaf->aabb, box);
+        ok = ok && leaf->valid == valid && same_box(leaf->aabb, box) &&
+             same_stamps(leaf, t_min, t_max);
       }
       continue;
     }
@@ -849,6 +978,7 @@ bool KDTree<PointType, Traits, Options>::validate() const {
     const Inner* inner = asInner(n);
     int size = 0, valid = 0;
     AABB box;
+    uint32_t t_min = Stamp::kNever, t_max = 0;
     for (const Node* child : {inner->left, inner->right}) {
       if (!child)
         continue;
@@ -858,16 +988,36 @@ bool KDTree<PointType, Traits, Options>::validate() const {
       if (child->valid > 0) {
         valid += child->valid;
         box.expand(child->aabb);
+        if constexpr (TrackStamps) {
+          t_min = std::min(t_min, child->t_min);
+          t_max = std::max(t_max, child->t_max);
+        }
       }
       stack.push_back({child, stale || inner->tree_deleted});
     }
     ok = ok && inner->size == size;
     if (inner->tree_deleted)
-      ok = ok && inner->valid == 0;
+      ok = ok && inner->valid == 0 && same_stamps(inner, Stamp::kNever, 0);
     else if (!stale)
-      ok = ok && inner->valid == valid && same_box(inner->aabb, box);
+      ok = ok && inner->valid == valid && same_box(inner->aabb, box) &&
+           same_stamps(inner, t_min, t_max);
   }
   return ok && leaves == leaf_count_.load() && inners == inner_count_.load();
+}
+
+template <typename PointType, typename Traits, typename Options>
+std::vector<std::pair<PointType, uint32_t>>
+KDTree<PointType, Traits, Options>::stampedPoints() const {
+  static_assert(TrackStamps, "stampedPoints() needs Options::TRACK_STAMPS");
+  std::vector<std::pair<PointType, uint32_t>> out;
+  if constexpr (TrackStamps) {
+    std::shared_lock<SharedMutex> lock(tree_mutex_);
+    ItemVector items;
+    collect(root_, items);
+    for (const auto& item : items)
+      out.push_back({item.pt, item.stamp});
+  }
+  return out;
 }
 #endif
 
@@ -896,11 +1046,80 @@ int KDTree<PointType, Traits, Options>::longestAxis(const AABB& box) {
 }
 
 template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::StampArg
+KDTree<PointType, Traits, Options>::neverStamp() {
+  if constexpr (TrackStamps)
+    return Stamp::kNever;
+  else
+    return NoStampArg{};
+}
+
+template <typename PointType, typename Traits, typename Options>
+const PointType& KDTree<PointType, Traits, Options>::pointOf(const Item& item) {
+  if constexpr (TrackStamps)
+    return item.pt;
+  else
+    return item;
+}
+
+template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::Item
+KDTree<PointType, Traits, Options>::itemAt(const Leaf* leaf, int i) {
+  if constexpr (TrackStamps)
+    return {leaf->pts[i], stampsOf(leaf)[i]};
+  else
+    return leaf->pts[i];
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::storeItems(Leaf* leaf, const Item* items,
+                                           int n) {
+  if constexpr (TrackStamps) {
+    for (int i = 0; i < n; ++i) {
+      leaf->pts[i] = items[i].pt;
+      stampsOf(leaf)[i] = items[i].stamp;
+    }
+  } else {
+    std::copy(items, items + n, leaf->pts);
+  }
+  leaf->size = n;
+}
+
+template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::Op
+KDTree<PointType, Traits, Options>::makeOp(OpType type, const PointType& point,
+                                   const AABB& box,
+                                   [[maybe_unused]] StampArg stamp) {
+  if constexpr (TrackStamps)
+    return Op{{stamp}, type, point, box};
+  else
+    return Op{{}, type, point, box};
+}
+
+template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::StampArg
+KDTree<PointType, Traits, Options>::opStamp([[maybe_unused]] const Op& op) {
+  if constexpr (TrackStamps)
+    return op.stamp;
+  else
+    return NoStampArg{};
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::clearStampBounds(
+    [[maybe_unused]] Node* node) {
+  if constexpr (TrackStamps) {
+    node->t_min = Stamp::kNever;
+    node->t_max = 0;
+  }
+}
+
+template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::applyOp(const Op& op,
                                         std::vector<Node*>* candidates) {
   switch (op.type) {
     case OpType::kInsert:
-      root_ = insertInternal(root_, op.point, candidates);
+      root_ = insertInternal(root_, op.point, opStamp(op), candidates);
       break;
     case OpType::kDeletePoint:
       deletePointInternal(root_, op.point, candidates);
@@ -915,7 +1134,7 @@ template <typename PointType, typename Traits, typename Options>
 typename KDTree<PointType, Traits, Options>::Leaf*
 KDTree<PointType, Traits, Options>::newLeaf() {
   leaf_count_.fetch_add(1, std::memory_order_relaxed);
-  return new Leaf();
+  return new AllocatedLeaf();
 }
 
 template <typename PointType, typename Traits, typename Options>
@@ -930,10 +1149,11 @@ KDTree<PointType, Traits, Options>::newInner(float split, int axis) {
 template <typename PointType, typename Traits, typename Options>
 typename KDTree<PointType, Traits, Options>::Node*
 KDTree<PointType, Traits, Options>::insertInternal(Node* node, const PointType& pt,
+                                          StampArg stamp,
                                           std::vector<Node*>* candidates) {
   if (!node) {
     Leaf* leaf = newLeaf();
-    appendPoint(leaf, pt);
+    appendPoint(leaf, pt, stamp);
     return leaf;
   }
   if (node->is_leaf) {
@@ -941,7 +1161,7 @@ KDTree<PointType, Traits, Options>::insertInternal(Node* node, const PointType& 
     if (leaf->size == LeafSize)
       node = makeRoom(leaf);
     if (node->is_leaf) {
-      appendPoint(asLeaf(node), pt);
+      appendPoint(asLeaf(node), pt, stamp);
       return node;
     }
   }
@@ -949,7 +1169,7 @@ KDTree<PointType, Traits, Options>::insertInternal(Node* node, const PointType& 
   pushDown(inner);
   bool left = Traits::coord(pt, inner->axis) < inner->split;
   Node*& child = left ? inner->left : inner->right;
-  child = insertInternal(child, pt, candidates);
+  child = insertInternal(child, pt, stamp, candidates);
   child->parent = inner;
   child->is_left_child = left;
   updateInner(inner);
@@ -958,7 +1178,13 @@ KDTree<PointType, Traits, Options>::insertInternal(Node* node, const PointType& 
 }
 
 template <typename PointType, typename Traits, typename Options>
-void KDTree<PointType, Traits, Options>::appendPoint(Leaf* leaf, const PointType& pt) {
+void KDTree<PointType, Traits, Options>::appendPoint(Leaf* leaf, const PointType& pt,
+                                            [[maybe_unused]] StampArg stamp) {
+  if constexpr (TrackStamps) {
+    stampsOf(leaf)[leaf->size] = stamp;
+    leaf->t_min = std::min(leaf->t_min, stamp);
+    leaf->t_max = std::max(leaf->t_max, stamp);
+  }
   leaf->pts[leaf->size++] = pt;
   ++leaf->valid;
   leaf->aabb.expand(pt);
@@ -968,16 +1194,15 @@ void KDTree<PointType, Traits, Options>::appendPoint(Leaf* leaf, const PointType
 // caller links in. A leaf with deleted slots is compacted and returned
 // itself. Otherwise it splits at the median of its points along their longest
 // extent: it keeps the lower half, a new leaf takes the upper half, and a new
-// inner node holds both.
+// inner node holds both. Stamps move with their points.
 template <typename PointType, typename Traits, typename Options>
 typename KDTree<PointType, Traits, Options>::Node*
 KDTree<PointType, Traits, Options>::makeRoom(Leaf* leaf) {
-  PointType kept[LeafSize];
+  Item kept[LeafSize];
   int n = 0;
-  forEachValid(leaf, [&](int i) { kept[n++] = leaf->pts[i]; });
+  forEachValid(leaf, [&](int i) { kept[n++] = itemAt(leaf, i); });
   if (n < leaf->size) {
-    std::copy(kept, kept + n, leaf->pts);
-    leaf->size = n;
+    storeItems(leaf, kept, n);
     leaf->deleted = 0;
     updateLeaf(leaf);
     return leaf;
@@ -986,17 +1211,16 @@ KDTree<PointType, Traits, Options>::makeRoom(Leaf* leaf) {
   int axis = longestAxis(leaf->aabb);
   int m = n / 2;
   std::nth_element(kept, kept + m, kept + n,
-                   [axis](const PointType& a, const PointType& b) {
-                     return Traits::coord(a, axis) < Traits::coord(b, axis);
+                   [axis](const Item& a, const Item& b) {
+                     return Traits::coord(pointOf(a), axis) <
+                            Traits::coord(pointOf(b), axis);
                    });
-  Inner* inner = newInner(Traits::coord(kept[m], axis), axis);
+  Inner* inner = newInner(Traits::coord(pointOf(kept[m]), axis), axis);
   Leaf* upper = newLeaf();
-  std::copy(kept, kept + m, leaf->pts);
-  leaf->size = m;
+  storeItems(leaf, kept, m);
   leaf->deleted = 0;
   updateLeaf(leaf);
-  std::copy(kept + m, kept + n, upper->pts);
-  upper->size = n - m;
+  storeItems(upper, kept + m, n - m);
   updateLeaf(upper);
   inner->parent = leaf->parent;
   inner->is_left_child = leaf->is_left_child;
@@ -1086,6 +1310,7 @@ void KDTree<PointType, Traits, Options>::killSubtree(Node* node) {
     node->tree_deleted = true;
   node->valid = 0;
   node->aabb = AABB();
+  clearStampBounds(node);
 }
 
 // Called by writers before descending into a node
@@ -1114,9 +1339,14 @@ template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::updateLeaf(Leaf* leaf) {
   leaf->valid = 0;
   leaf->aabb = AABB();
+  clearStampBounds(leaf);
   forEachValid(leaf, [&](int i) {
     ++leaf->valid;
     leaf->aabb.expand(leaf->pts[i]);
+    if constexpr (TrackStamps) {
+      leaf->t_min = std::min(leaf->t_min, stampsOf(leaf)[i]);
+      leaf->t_max = std::max(leaf->t_max, stampsOf(leaf)[i]);
+    }
   });
 }
 
@@ -1125,6 +1355,7 @@ void KDTree<PointType, Traits, Options>::updateInner(Inner* node) {
   node->size = 0;
   node->valid = 0;
   node->aabb = AABB();
+  clearStampBounds(node);
   for (Node* child : {node->left, node->right}) {
     if (!child)
       continue;
@@ -1132,6 +1363,10 @@ void KDTree<PointType, Traits, Options>::updateInner(Inner* node) {
     if (!node->tree_deleted && child->valid > 0) {
       node->valid += child->valid;
       node->aabb.expand(child->aabb);
+      if constexpr (TrackStamps) {
+        node->t_min = std::min(node->t_min, child->t_min);
+        node->t_max = std::max(node->t_max, child->t_max);
+      }
     }
   }
 }
@@ -1159,11 +1394,10 @@ void KDTree<PointType, Traits, Options>::markIfUnbalanced(
   }
 }
 
-// Appends the non-deleted points. Iterative: an unbalanced chain must not
-// overflow the stack.
+// Iterative: an unbalanced chain must not overflow the stack.
 template <typename PointType, typename Traits, typename Options>
-void KDTree<PointType, Traits, Options>::collect(const Node* node,
-                                        PointVector<PointType>& pts) const {
+template <typename Vec>
+void KDTree<PointType, Traits, Options>::collect(const Node* node, Vec& out) const {
   if (!node)
     return;
   std::vector<const Node*> stack{node};
@@ -1174,7 +1408,12 @@ void KDTree<PointType, Traits, Options>::collect(const Node* node,
       continue;
     if (n->is_leaf) {
       const Leaf* leaf = asLeaf(n);
-      forEachValid(leaf, [&](int i) { pts.push_back(leaf->pts[i]); });
+      forEachValid(leaf, [&](int i) {
+        if constexpr (std::is_same_v<typename Vec::value_type, PointType>)
+          out.push_back(leaf->pts[i]);
+        else
+          out.push_back(itemAt(leaf, i));
+      });
     } else {
       const Inner* inner = asInner(n);
       if (inner->left)
@@ -1196,7 +1435,7 @@ void KDTree<PointType, Traits, Options>::destroy(Node* node) {
     Node* n = stack.back();
     stack.pop_back();
     if (n->is_leaf) {
-      delete asLeaf(n);
+      delete static_cast<AllocatedLeaf*>(asLeaf(n));
       leaf_count_.fetch_sub(1, std::memory_order_relaxed);
     } else {
       Inner* inner = asInner(n);
@@ -1212,15 +1451,14 @@ void KDTree<PointType, Traits, Options>::destroy(Node* node) {
 
 template <typename PointType, typename Traits, typename Options>
 typename KDTree<PointType, Traits, Options>::Node*
-KDTree<PointType, Traits, Options>::buildRecursive(PointVector<PointType>& pts, size_t l,
+KDTree<PointType, Traits, Options>::buildRecursive(ItemVector& items, size_t l,
                                           size_t r) {
   if (l >= r)
     return nullptr;
   const size_t n = r - l;
   if (n <= static_cast<size_t>(LeafSize)) {
     Leaf* leaf = newLeaf();
-    std::copy(pts.begin() + l, pts.begin() + r, leaf->pts);
-    leaf->size = static_cast<int>(n);
+    storeItems(leaf, items.data() + l, static_cast<int>(n));
     updateLeaf(leaf);
     return leaf;
   }
@@ -1238,24 +1476,25 @@ KDTree<PointType, Traits, Options>::buildRecursive(PointVector<PointType>& pts, 
   // are flat, and z splits near the top of the tree prune poorly.
   AABB box;
   for (size_t i = l; i < r; ++i) {
-    box.expand(pts[i]);
+    box.expand(pointOf(items[i]));
   }
   int axis = longestAxis(box);
-  std::nth_element(pts.begin() + l, pts.begin() + m, pts.begin() + r,
-                   [&](const PointType& a, const PointType& b) {
-                     return Traits::coord(a, axis) < Traits::coord(b, axis);
+  std::nth_element(items.begin() + l, items.begin() + m, items.begin() + r,
+                   [&](const Item& a, const Item& b) {
+                     return Traits::coord(pointOf(a), axis) <
+                            Traits::coord(pointOf(b), axis);
                    });
-  Inner* node = newInner(Traits::coord(pts[m], axis), axis);
+  Inner* node = newInner(Traits::coord(pointOf(items[m]), axis), axis);
   // Both sides hold at least one point: n > LeafSize >= 2
 #ifdef LIKD_TREE_USE_TBB
   if (r - l > MIN_PARALLEL_BUILD_SIZE) {
-    tbb::parallel_invoke([&] { node->left = buildRecursive(pts, l, m); },
-                         [&] { node->right = buildRecursive(pts, m, r); });
+    tbb::parallel_invoke([&] { node->left = buildRecursive(items, l, m); },
+                         [&] { node->right = buildRecursive(items, m, r); });
   } else
 #endif
   {
-    node->left = buildRecursive(pts, l, m);
-    node->right = buildRecursive(pts, m, r);
+    node->left = buildRecursive(items, l, m);
+    node->right = buildRecursive(items, m, r);
   }
   node->left->parent = node;
   node->left->is_left_child = true;
@@ -1416,10 +1655,10 @@ void KDTree<PointType, Traits, Options>::rebuildSubtrees(
 
   std::for_each(TREE_PAR, indices.begin(), indices.end(), [&](size_t i) {
     // Deleted points are dropped; a fully deleted subtree becomes nullptr
-    PointVector<PointType> pts;
-    pts.reserve(nodes_to_rebuild[i]->valid);
-    collect(nodes_to_rebuild[i], pts);
-    new_nodes[i] = buildRecursive(pts, 0, pts.size());
+    ItemVector items;
+    items.reserve(nodes_to_rebuild[i]->valid);
+    collect(nodes_to_rebuild[i], items);
+    new_nodes[i] = buildRecursive(items, 0, items.size());
   });
 
   // Critical section - swap pointers (brief exclusive lock)
