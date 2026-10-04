@@ -587,11 +587,21 @@ int main(int argc, char** argv) {
           ikd->Box_Search(toIkdBox(boxAround(q)), res);
         });
     auto r4 = Clock::now();
+    // ikd-tree does not sort its radius results: compare it with both. Runs
+    // last so that the rows above are timed as before.
+    LikdTree::SearchOptions unsorted;
+    unsorted.sorted = false;
+    size_t likd_in_radius_unsorted = countResults(
+        range_queries, [&](const PointType& q, PointVector<PointType>& res) {
+          likd.radiusSearch(q, radius, res, dists, unsorted);
+        });
+    auto r5 = Clock::now();
 
     printRow("Build", elapsedMs(t0, t1), elapsedMs(t2, t3));
     printRow("1-NN x200k (seq)", elapsedMs(q0, q1), elapsedMs(q1, q2));
     printRow("5-NN x200k (seq)", elapsedMs(q2, q3), elapsedMs(q3, q4));
     printRow("Radius search x20k (seq)", elapsedMs(r0, r1), elapsedMs(r1, r2));
+    printRow("Radius unsorted x20k (seq)", elapsedMs(r4, r5), elapsedMs(r1, r2));
     printRow("Box search x20k (seq)", elapsedMs(r2, r3), elapsedMs(r3, r4));
     printf("  radius %.1f m: %.1f points per query, box half size %.1f m: %.1f\n",
            radius, double(likd_in_radius) / range_queries.size(), box_half,
@@ -599,6 +609,9 @@ int main(int argc, char** argv) {
     if (likd_in_radius != ikd_in_radius)
       printf("  WARNING: radius search found %zu points, ikd-tree %zu\n",
              likd_in_radius, ikd_in_radius);
+    if (likd_in_radius_unsorted != likd_in_radius)
+      printf("  WARNING: unsorted radius search found %zu points, sorted %zu\n",
+             likd_in_radius_unsorted, likd_in_radius);
     // ikd-tree's boxes are half-open, [min, max): only likd-tree finds points
     // lying exactly on a max face
     if (likd_in_box < ikd_in_box)
