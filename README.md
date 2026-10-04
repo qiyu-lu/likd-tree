@@ -9,11 +9,39 @@
 
 > This repository continues [scomup/likd-tree](https://github.com/scomup/likd-tree)
 > by Liu Yang, which has had no updates since January 2026. It adds thread-safety
-> fixes, k-NN and box search, point and box deletion, and a like-for-like
-> benchmark against ikd-tree. See [License & Acknowledgements](#license--acknowledgements).
+> fixes, k-NN and box search, point and box deletion, leaf buckets that cut
+> memory per point by three quarters, and a like-for-like benchmark against
+> ikd-tree. See [License & Acknowledgements](#license--acknowledgements).
 
 ## C++ Version
 Inspired by [ikd-tree](https://github.com/hku-mars/ikd-Tree), `likd-tree` is completely reimplemented using modern C++17 and features a more intelligent and principled rebalance strategy, which significantly improves efficiency while keeping the structure lightweight and easy to maintain.
+
+### Data structure
+
+Points are stored in leaf buckets of up to 32 points, with a bit mask that
+marks the deleted ones; inner nodes only split space. When a point is added
+to a full leaf, the leaf is compacted if some of its points are deleted, and
+otherwise split in two at the median of its points along their longest
+extent. A batch build fills leaves to about 80%. Every node keeps the
+bounding box of the points below it that are not deleted: searches prune
+with it, and box deletion uses it to tag whole subtrees in O(1).
+
+For `pcl::PointXYZ` this takes about 25 bytes per point. Earlier versions of
+this repository used one 80-byte node per point (96 bytes with allocator
+overhead); ikd-tree uses 160.
+
+The leaf size is a compile-time option:
+
+```cpp
+struct MyOptions : DefaultOptions {
+  static constexpr int LEAF_SIZE = 16;  // 2 to 64
+};
+KDTree<PointType, PointTraits<PointType>, MyOptions> tree;
+```
+
+The default is 32. On the benchmark maps, 64 saves another 10% of memory
+but makes 5-NN queries up to 13% slower, and 16 needs about 31 bytes per
+point.
 
 ## Python Version
 
@@ -26,15 +54,17 @@ pip install likd-tree
 For details see [Python Usage](#python-usage)
 
 > **Note:** the `likd-tree` package on PyPI is the original author's 1.0.2
-> release, and the bindings in `python/` still build that version. Neither
-> includes the C++ changes in this repository yet.
+> release, and the bindings in `python/` still build that version, from their
+> own older copy of the header (`python/src/likd_tree.hpp`). Neither includes
+> the C++ changes in this repository yet.
 
 ## 🚀 Key Features
 
 - **🔄 Incremental**: Dynamic point insertion and deletion (by point or by box) with automatic background rebalancing
 - **🔍 Queries**: Nearest neighbor, k-nearest neighbors, radius and box search
-- **🪶 Lightweight**: Header-only library (~1100 lines of C++17) - no build required
-- **⚡ Fast**: On a 1.7M-point LiDAR map, 2.3x faster incremental insertion, 1.4x faster 5-NN search and 20x faster box deletion than ikd-tree
+- **🪶 Lightweight**: Header-only library (~1400 lines of C++17) - no build required
+- **📦 Compact**: About 25 bytes per `pcl::PointXYZ` point, a sixth of ikd-tree's: points are stored in leaf buckets
+- **⚡ Fast**: On a 1.3M-point LiDAR map streamed in scan-sized frames, 3.9x faster incremental insertion, 5.4x faster 5-NN search and 30x faster box deletion than ikd-tree
 - **🧠 Intelligent**: Smarter rebalance strategy with delayed and batched rebuilding of multiple non-overlapping unbalanced subtrees *(paper-worthy?)* 
 - **🔧 Flexible**: Support for custom point types via PointTraits template - use any point representation (arrays, getters, etc.)
 
@@ -42,35 +72,60 @@ For details see [Python Usage](#python-usage)
 
 Both trees answer the same queries with the same threading (both sequential,
 or both TBB-parallel). Each frame is queried against the map before it is
-inserted, as in LiDAR odometry. AMD Ryzen 7 7700, GCC 9.4, -O3.
+inserted, as in LiDAR odometry. Medians of 10 runs on an AMD Ryzen 7 7700,
+GCC 9.4, -O3. Memory is the heap growth per point (glibc `mallinfo()`),
+allocator overhead included.
 
-### Real LiDAR map
-`test/pcd/globalMap.pcd` (1.74M points) streamed in file order, 2000-point frames:
+### Real LiDAR maps
+Both maps are streamed in file order, 2000-point frames. A frame of
+`Global_map_sprase.pcd` (1.29M points) spans about 31 m, like a real scan.
+`globalMap.pcd` (1.74M points) is stored in an order that makes each frame
+span most of the map, so its streaming numbers resemble random insertion.
 
-| Metric | likd-tree | ikd-tree | Speedup |
-|--------|-----------|----------|---------|
-| Batch build, all points | 119 ms | 583 ms | **4.9x** |
-| Insert, total | 1236 ms | 2786 ms | **2.3x** |
-| Insert, worst frame | 8.9 ms | 54.9 ms | **6.2x** |
-| 1-NN queries, sequential | 2081 ms | 2734 ms | **1.3x** |
-| 5-NN queries, sequential | 3802 ms | 5278 ms | **1.4x** |
-| 5-NN queries, TBB | 533 ms | 710 ms | **1.3x** |
-
-Local map kept to a 100 m cube around the sensor, box deletion every 10 frames:
+`Global_map_sprase.pcd`:
 
 | Metric | likd-tree | ikd-tree | Speedup |
 |--------|-----------|----------|---------|
-| Box deletion, total | 13.6 ms | 293.5 ms | **21.6x** |
-| Nodes in memory (78,334 valid points) | 78,338 | 236,611 | |
+| Batch build, all points | 33 ms | 359 ms | **10.9x** |
+| Insert, total | 352 ms | 1355 ms | **3.9x** |
+| Insert, slowest 1% of frames | 1.1 ms | 19.3 ms | **17x** |
+| 1-NN queries, sequential | 366 ms | 2312 ms | **6.3x** |
+| 5-NN queries, sequential | 773 ms | 4141 ms | **5.4x** |
+| 5-NN queries, TBB | 156 ms | 809 ms | **5.2x** |
+| Memory after batch build | 25.3 B/point | 160 B/point | |
+| Memory after streaming | 25.5 B/point | 186 B/point | |
+
+`globalMap.pcd`:
+
+| Metric | likd-tree | ikd-tree | Speedup |
+|--------|-----------|----------|---------|
+| Batch build, all points | 51 ms | 577 ms | **11.3x** |
+| Insert, total | 683 ms | 2530 ms | **3.7x** |
+| Insert, slowest 1% of frames | 2.1 ms | 37.4 ms | **18x** |
+| 1-NN queries, sequential | 1153 ms | 2643 ms | **2.3x** |
+| 5-NN queries, sequential | 1839 ms | 4924 ms | **2.7x** |
+| 5-NN queries, TBB | 281 ms | 676 ms | **2.4x** |
+| Memory after batch build | 25.3 B/point | 160 B/point | |
+| Memory after streaming | 28.1 B/point | 254 B/point | |
+
+Local map kept to a 100 m cube around the sensor, box deletion every 10
+frames, `Global_map_sprase.pcd`:
+
+| Metric | likd-tree | ikd-tree | Speedup |
+|--------|-----------|----------|---------|
+| Box deletion, total | 0.96 ms | 28.4 ms | **30x** |
+| Points stored, deleted ones included (105,921 kept) | 105,968 | 107,705 | |
+| Memory per point kept | 26.2 B | 2274 B | |
 
 ### 100K uniform random points
 1000-point frames:
 
 | Metric | likd-tree | ikd-tree | Speedup |
 |--------|-----------|----------|---------|
-| Insert, total | 34.5 ms | 84.9 ms | **2.5x** |
-| 5-NN queries, sequential | 163.7 ms | 207.7 ms | **1.3x** |
-| 5-NN queries, TBB | 24.6 ms | 28.0 ms | **1.1x** |
+| Insert, total | 24.4 ms | 77.9 ms | **3.2x** |
+| 5-NN queries, sequential | 80.0 ms | 188.2 ms | **2.4x** |
+| 5-NN queries, TBB | 15.7 ms | 27.5 ms | **1.7x** |
+| Memory after streaming | 29.5 B/point | 161 B/point | |
 
 Earlier versions of this README compared TBB-parallel likd-tree queries with
 sequential ikd-tree queries; the query numbers above are like-for-like.
@@ -79,8 +134,9 @@ sequential ikd-tree queries; the query numbers above are like-for-like.
 ```bash
 cmake -B build -DBUILD_BENCHMARK=ON
 cmake --build build
-./build/benchmark                           # random points
-./build/benchmark ./test/pcd/globalMap.pcd  # real map + local-map test
+./build/benchmark                                    # random points
+./build/benchmark ./test/pcd/Global_map_sprase.pcd   # real map + local-map test
+./build/benchmark ./test/pcd/globalMap.pcd
 ```
 
 ## 🎯 Quick Start
@@ -159,6 +215,12 @@ size_t bytes = tree.memoryUsage();
   become visible. Calling `waitForRebuild()` from time to time keeps both in
   check.
 
+**Upgrading from earlier versions of this repository:**
+- `KDTree<...>::Node` is no longer public.
+- `nodeCount()` now returns the number of points stored, including deleted
+  points that a rebuild has not reclaimed yet; with leaf buckets it no longer
+  reflects memory. Use `memoryUsage()` for that.
+
 ### Custom Point Types
 
 likd-tree supports arbitrary point types through the `PointTraits` template. By default, it works with point types that have `x`, `y`, `z` members, but you can easily customize it:
@@ -188,6 +250,9 @@ struct PointTraits<MyPoint> {
 // Use it like any other point type
 KDTree<MyPoint> tree;
 ```
+
+The point type must be default-constructible and copy-assignable: leaves
+store points in fixed-size arrays.
 
 For detailed examples with different point representations (arrays, getters, etc.), see [test/demo.cpp](test/demo.cpp).
 
