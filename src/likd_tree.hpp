@@ -30,7 +30,10 @@ Distributed under MIT license. See LICENSE for more information.
 constexpr double KDTREE_ALPHA = 0.75;
 constexpr int INSERTION_BATCH_SIZE = 100;
 constexpr int MIN_SUB_NUM = 8;
+// Subtrees larger than this are built with parallel tasks (TBB only)
+constexpr size_t MIN_PARALLEL_BUILD_SIZE = 20000;
 #ifdef LIKD_TREE_USE_TBB
+#include <tbb/parallel_invoke.h>
 #define TREE_PAR std::execution::par
 #else
 #define TREE_PAR std::execution::seq
@@ -145,8 +148,7 @@ class KDTree {
   bool needRebuild(Node* node) const;
   void collect(Node* node, PointVector<PointType>& pts) const;
   static void destroy(Node* node);
-  Node* buildRecursive(PointVector<PointType>& pts, size_t l, size_t r,
-                       int axis);
+  Node* buildRecursive(PointVector<PointType>& pts, size_t l, size_t r);
   void nearestNeighborInternal(Node* node, const PointType& query,
                                const PointType*& best_pt,
                                float& best_dist2) const;
@@ -282,7 +284,7 @@ void KDTree<PointType, Traits>::build(const PointVector<PointType>& pts) {
   // The worker may still hold pointers into the current tree
   waitForRebuild();
   PointVector<PointType> tmp = pts;
-  Node* new_root = tmp.empty() ? nullptr : buildRecursive(tmp, 0, tmp.size(), 0);
+  Node* new_root = buildRecursive(tmp, 0, tmp.size());
   Node* old_root;
   {
     std::unique_lock<SharedMutex> lock(tree_mutex_);
@@ -589,21 +591,40 @@ void KDTree<PointType, Traits>::destroy(Node* node) {
 template <typename PointType, typename Traits>
 typename KDTree<PointType, Traits>::Node*
 KDTree<PointType, Traits>::buildRecursive(PointVector<PointType>& pts, size_t l,
-                                          size_t r, int axis) {
+                                          size_t r) {
   if (l >= r)
     return nullptr;
+  // Split along the longest extent rather than cycling the axes: LiDAR maps
+  // are flat, and z splits near the top of the tree prune poorly.
+  AABB box;
+  for (size_t i = l; i < r; ++i) {
+    box.expand(pts[i]);
+  }
+  int axis = 0;
+  for (int a = 1; a < Traits::DIM; ++a) {
+    if (box.max[a] - box.min[a] > box.max[axis] - box.min[axis])
+      axis = a;
+  }
   size_t m = l + (r - l) / 2;
   std::nth_element(pts.begin() + l, pts.begin() + m, pts.begin() + r,
                    [&](const PointType& a, const PointType& b) {
                      return Traits::coord(a, axis) < Traits::coord(b, axis);
                    });
   Node* node = new Node(pts[m], axis);
-  node->left = buildRecursive(pts, l, m, (axis + 1) % Traits::DIM);
+#ifdef LIKD_TREE_USE_TBB
+  if (r - l > MIN_PARALLEL_BUILD_SIZE) {
+    tbb::parallel_invoke([&] { node->left = buildRecursive(pts, l, m); },
+                         [&] { node->right = buildRecursive(pts, m + 1, r); });
+  } else
+#endif
+  {
+    node->left = buildRecursive(pts, l, m);
+    node->right = buildRecursive(pts, m + 1, r);
+  }
   if (node->left) {
     node->left->parent = node;
     node->left->is_left_child = true;
   }
-  node->right = buildRecursive(pts, m + 1, r, (axis + 1) % Traits::DIM);
   if (node->right) {
     node->right->parent = node;
     node->right->is_left_child = false;
@@ -743,8 +764,7 @@ void KDTree<PointType, Traits>::rebuildSubtrees(
     pts.reserve(nodes_to_rebuild[i]->subtree_size);
     collect(nodes_to_rebuild[i], pts);
 
-    new_nodes[i] =
-        buildRecursive(pts, 0, pts.size(), nodes_to_rebuild[i]->axis);
+    new_nodes[i] = buildRecursive(pts, 0, pts.size());
 
     new_nodes[i]->parent = nodes_to_rebuild[i]->parent;
     new_nodes[i]->is_left_child = nodes_to_rebuild[i]->is_left_child;
