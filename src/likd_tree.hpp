@@ -868,18 +868,17 @@ void KDTree<PointType, Traits, Options>::appendPoint(Leaf* leaf, const PointType
 }
 
 // Makes room in a full leaf and returns what takes its place, which the
-// caller links in. Normally the leaf splits at the median of its points along
-// their longest extent: it keeps the lower half, a new leaf takes the upper
-// half, a new inner node holds both, and deleted slots are dropped. With
-// fewer than two points left there is nothing to split: the leaf itself is
-// returned, compacted.
+// caller links in. A leaf with deleted slots is compacted and returned
+// itself. Otherwise it splits at the median of its points along their longest
+// extent: it keeps the lower half, a new leaf takes the upper half, and a new
+// inner node holds both.
 template <typename PointType, typename Traits, typename Options>
 typename KDTree<PointType, Traits, Options>::Node*
 KDTree<PointType, Traits, Options>::makeRoom(Leaf* leaf) {
   PointType kept[LeafSize];
   int n = 0;
   forEachValid(leaf, [&](int i) { kept[n++] = leaf->pts[i]; });
-  if (n < 2) {
+  if (n < leaf->size) {
     std::copy(kept, kept + n, leaf->pts);
     leaf->size = n;
     leaf->deleted = 0;

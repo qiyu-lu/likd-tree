@@ -481,6 +481,24 @@ void testInsertAfterDeletingSubtrees() {
   }
 }
 
+// A full leaf with a deleted slot takes a new point by compacting, without a
+// split. N is the leaf size.
+template <typename Tree, int N>
+void testReuseDeletedSlot() {
+  std::printf("[deleted slots reused]\n");
+  std::mt19937 rng(18);
+  Points pts = blob(rng, N);
+  Tree tree;
+  tree.build(pts);  // a single full leaf
+  size_t one_leaf = tree.memoryUsage();
+  tree.deletePoints(Points{pts[0]}, true);
+  tree.addPoints(Points{Pt{pts[0].x + 0.5f, pts[0].y, pts[0].z}}, true);
+  CHECK(tree.memoryUsage() == one_leaf);
+  CHECK(tree.nodeCount() == N);
+  CHECK(tree.size() == N);
+  CHECK(tree.validate());
+}
+
 // Random writes, each followed by waiting for the rebuild and a check of the
 // whole tree's structure.
 template <typename Tree>
@@ -666,7 +684,8 @@ void testReadersDuringWritesAndBuild() {
   CHECK(matchesBruteForce(tree, last, rng, 100));
 }
 
-template <typename Tree>
+// N is the tree's leaf size
+template <typename Tree, int N>
 void bruteForceTests(const char* label) {
   std::printf("== brute force, %s\n", label);
   testIncrementalQueries<Tree>();
@@ -680,6 +699,7 @@ void bruteForceTests(const char* label) {
   testEmptiedLeaves<Tree>();
   testInsertAfterDeletingSubtrees<Tree>();
   testValidatedRandomWrites<Tree>();
+  testReuseDeletedSlot<Tree, N>();
 }
 
 template <typename Tree>
@@ -699,10 +719,10 @@ void concurrencyTests(const char* label) {
 
 int main() {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
-  bruteForceTests<LeafTree<2>>("leaf size 2");
-  bruteForceTests<LeafTree<4>>("leaf size 4");
-  bruteForceTests<KDTree<Pt>>("default leaf size (32)");
-  bruteForceTests<LeafTree<64>>("leaf size 64");
+  bruteForceTests<LeafTree<2>, 2>("leaf size 2");
+  bruteForceTests<LeafTree<4>, 4>("leaf size 4");
+  bruteForceTests<KDTree<Pt>, DefaultOptions::LEAF_SIZE>("default leaf size (32)");
+  bruteForceTests<LeafTree<64>, 64>("leaf size 64");
   concurrencyTests<LeafTree<2>>("leaf size 2");
   concurrencyTests<KDTree<Pt>>("default leaf size (32)");
   if (g_failures) {
