@@ -8,7 +8,7 @@ is the same code in both executables, so its ratio shows how much the machine
 drifted between the two sets of runs.
 
     python3 test/compare_benchmarks.py build/benchmark_base build/benchmark \
-        --map test/pcd/globalMap.pcd --runs 5
+        --map test/pcd/globalMap.pcd --map test/pcd/Global_map_sprase.pcd
 
 Passing the same executable twice (an A/A run) measures the noise floor.
 """
@@ -94,15 +94,20 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("base")
     parser.add_argument("new")
-    parser.add_argument("--map", help="PCD map for the second data set")
+    parser.add_argument("--map", action="append", default=[],
+                        help="PCD map to run as well; repeat for several")
+    parser.add_argument("--skip-random", action="store_true",
+                        help="skip the 100K random points")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--save-dir", help="keep every run's output here")
     args = parser.parse_args()
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
-    compare(args.base, args.new, [], args.runs, "random", args.save_dir)
-    if args.map:
-        compare(args.base, args.new, [args.map], args.runs, "map", args.save_dir)
+    if not args.skip_random:
+        compare(args.base, args.new, [], args.runs, "random", args.save_dir)
+    for path in args.map:
+        label = os.path.splitext(os.path.basename(path))[0]
+        compare(args.base, args.new, [path], args.runs, label, args.save_dir)
 
 
 if __name__ == "__main__":
