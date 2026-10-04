@@ -5,6 +5,10 @@
 //   ./benchmark            100K uniform random points, 1000-point frames
 //   ./benchmark map.pcd    stream a real map in file order, 2000-point frames,
 //                          plus a local-map test with box deletion
+//
+// Memory is the heap growth (glibc mallinfo, all arenas) while one tree is
+// built or fed alone, divided by the points it holds. RSS growth is printed
+// next to it because the heap figure leaves out fragmentation.
 
 // Enable TBB parallel execution (define before including likd_tree.hpp)
 #define LIKD_TREE_USE_TBB
@@ -12,17 +16,24 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 #include <tbb/parallel_for.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../src/likd_tree.hpp"
 #include "ikd_Tree.h"
+
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 using PointType = pcl::PointXYZ;
 using LikdTree = KDTree<PointType>;
@@ -35,6 +46,46 @@ constexpr int K = 5;  // FAST-LIO matches each point against 5 neighbors
 
 double elapsedMs(Clock::time_point a, Clock::time_point b) {
   return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+// Heap bytes in use across all malloc arenas, or -1 off glibc. The mallinfo()
+// fields are int and overflow past 2 GB (4 GB when read as unsigned); glibc
+// 2.31 has no mallinfo2(), and this benchmark stays below ~300 MB.
+long heapBytes() {
+#ifdef __GLIBC__
+  struct mallinfo m = mallinfo();
+  return static_cast<long>(static_cast<unsigned>(m.uordblks)) +
+         static_cast<long>(static_cast<unsigned>(m.hblkhd));
+#else
+  return -1;
+#endif
+}
+
+// Resident set size in bytes, or -1 without /proc
+long rssBytes() {
+  std::ifstream statm("/proc/self/statm");
+  long size = 0, resident = 0;
+  if (!(statm >> size >> resident)) return -1;
+  return resident * sysconf(_SC_PAGESIZE);
+}
+
+// Hands freed heap pages back to the OS, so that RSS growth measured from
+// here on comes from new allocations rather than reused pages.
+void releaseFreeMemory() {
+#ifdef __GLIBC__
+  malloc_trim(0);
+#endif
+}
+
+struct MemorySample {
+  long heap, rss;
+  static MemorySample now() { return {heapBytes(), rssBytes()}; }
+};
+
+// Bytes per point grown between two samples, NAN where unavailable
+double perPoint(long before, long after, long points) {
+  if (before < 0 || after < 0 || points <= 0) return NAN;
+  return double(after - before) / points;
 }
 
 std::vector<float> likdNN(const LikdTree& tree, const PointVector<PointType>& qs) {
@@ -81,14 +132,56 @@ struct Totals {
          del = 0;
 };
 
-void printRow(const char* name, double likd, double ikd) {
-  printf("  %-28s likd-tree %9.2f ms | ikd-tree %9.2f ms | %5.2fx\n", name, likd,
-         ikd, ikd / likd);
+void printRow(const char* name, double likd, double ikd,
+              const char* unit = "ms") {
+  printf("  %-28s likd-tree %9.2f %-4s | ikd-tree %9.2f %-4s | %5.2fx\n", name,
+         likd, unit, ikd, unit, ikd / likd);
+}
+
+void printLikd(const char* name, double likd, const char* unit) {
+  printf("  %-28s likd-tree %9.2f %s\n", name, likd, unit);
+}
+
+// Boxes that delete everything outside a cube of half size `half` around the
+// batch centroid (like FAST-LIO's map segmentation)
+std::vector<LikdTree::AABB> localMapBoxes(const PointVector<PointType>& batch,
+                                          float half) {
+  float c[3] = {0, 0, 0};
+  for (const auto& p : batch) {
+    c[0] += p.x / batch.size();
+    c[1] += p.y / batch.size();
+    c[2] += p.z / batch.size();
+  }
+  std::vector<LikdTree::AABB> boxes;
+  for (int axis = 0; axis < 3; ++axis) {
+    for (int side = 0; side < 2; ++side) {
+      LikdTree::AABB box({-1e6f, -1e6f, -1e6f}, {1e6f, 1e6f, 1e6f});
+      if (side == 0)
+        box.max[axis] = c[axis] - half;
+      else
+        box.min[axis] = c[axis] + half;
+      boxes.push_back(box);
+    }
+  }
+  return boxes;
+}
+
+std::vector<BoxPointType> toIkdBoxes(const std::vector<LikdTree::AABB>& boxes) {
+  std::vector<BoxPointType> out;
+  for (const auto& box : boxes) {
+    BoxPointType b;
+    for (int i = 0; i < 3; ++i) {
+      b.vertex_min[i] = box.min[i];
+      b.vertex_max[i] = box.max[i];
+    }
+    out.push_back(b);
+  }
+  return out;
 }
 
 // Feed `pts` frame by frame: query the frame against the map, then insert it.
 // With local_map_half > 0, every 10 frames delete everything outside a cube
-// around the frame centroid (like FAST-LIO's map segmentation).
+// around the frame centroid.
 void runStream(const PointVector<PointType>& pts, size_t frame,
                float local_map_half) {
   LikdTree likd;
@@ -146,30 +239,8 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
     I.insert_max = std::max(I.insert_max, elapsedMs(a1, a2));
 
     if (local_map_half > 0 && frames % 10 == 9) {
-      float c[3] = {0, 0, 0};
-      for (const auto& p : batch) {
-        c[0] += p.x / batch.size();
-        c[1] += p.y / batch.size();
-        c[2] += p.z / batch.size();
-      }
-      std::vector<LikdTree::AABB> boxes;
-      std::vector<BoxPointType> ikd_boxes;
-      for (int axis = 0; axis < 3; ++axis) {
-        for (int side = 0; side < 2; ++side) {
-          LikdTree::AABB box({-1e6f, -1e6f, -1e6f}, {1e6f, 1e6f, 1e6f});
-          if (side == 0)
-            box.max[axis] = c[axis] - local_map_half;
-          else
-            box.min[axis] = c[axis] + local_map_half;
-          boxes.push_back(box);
-          BoxPointType b;
-          for (int i = 0; i < 3; ++i) {
-            b.vertex_min[i] = box.min[i];
-            b.vertex_max[i] = box.max[i];
-          }
-          ikd_boxes.push_back(b);
-        }
-      }
+      std::vector<LikdTree::AABB> boxes = localMapBoxes(batch, local_map_half);
+      std::vector<BoxPointType> ikd_boxes = toIkdBoxes(boxes);
       auto d0 = Clock::now();
       likd.deleteBoxes(boxes);
       auto d1 = Clock::now();
@@ -203,6 +274,66 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
   delete ikd;
 }
 
+// The same frames and box deletions as runStream, fed into one tree alone and
+// without queries.
+template <typename Build, typename Add, typename DeleteBoxes>
+void feed(const PointVector<PointType>& pts, size_t frame, float local_map_half,
+          Build build, Add add, DeleteBoxes delete_boxes) {
+  build(PointVector<PointType>(pts.begin(), pts.begin() + frame));
+  size_t frames = 0;
+  for (size_t s = frame; s < pts.size(); s += frame, ++frames) {
+    PointVector<PointType> batch(pts.begin() + s,
+                                 pts.begin() + std::min(s + frame, pts.size()));
+    add(batch);
+    if (local_map_half > 0 && frames % 10 == 9)
+      delete_boxes(localMapBoxes(batch, local_map_half));
+  }
+}
+
+// runStream interleaves the two trees, so their heap growth can't be told
+// apart there: feed each tree alone and divide by the points it still holds.
+void streamMemory(const PointVector<PointType>& pts, size_t frame,
+                  float local_map_half) {
+  double likd_heap, likd_rss, likd_usage, ikd_heap, ikd_rss;
+  {
+    releaseFreeMemory();
+    MemorySample before = MemorySample::now();
+    LikdTree likd;
+    feed(pts, frame, local_map_half,
+         [&](const PointVector<PointType>& f) { likd.build(f); },
+         [&](const PointVector<PointType>& b) { likd.addPoints(b); },
+         [&](const std::vector<LikdTree::AABB>& boxes) { likd.deleteBoxes(boxes); });
+    likd.waitForRebuild();
+    MemorySample after = MemorySample::now();
+    int valid = likd.size();
+    likd_heap = perPoint(before.heap, after.heap, valid);
+    likd_rss = perPoint(before.rss, after.rss, valid);
+    likd_usage = double(likd.memoryUsage()) / valid;
+  }
+  {
+    IkdTree* ikd = new IkdTree();  // operation queue allocated here, not counted
+    releaseFreeMemory();
+    MemorySample before = MemorySample::now();
+    feed(pts, frame, local_map_half,
+         [&](const PointVector<PointType>& f) { ikd->Build(f); },
+         [&](PointVector<PointType>& b) { ikd->Add_Points(b, false); },
+         [&](const std::vector<LikdTree::AABB>& boxes) {
+           std::vector<BoxPointType> b = toIkdBoxes(boxes);
+           ikd->Delete_Point_Boxes(b);
+         });
+    // ikd-Tree has no call that waits for its rebuild thread
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    MemorySample after = MemorySample::now();
+    int valid = ikd->validnum();
+    ikd_heap = perPoint(before.heap, after.heap, valid);
+    ikd_rss = perPoint(before.rss, after.rss, valid);
+    delete ikd;
+  }
+  printRow("Heap per valid point", likd_heap, ikd_heap, "B/pt");
+  printRow("RSS growth per valid point", likd_rss, ikd_rss, "B/pt");
+  printLikd("memoryUsage() per valid pt", likd_usage, "B/pt");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -231,19 +362,29 @@ int main(int argc, char** argv) {
     frame = 1000;
     std::cout << "100K uniform random points in [-100, 100]^3\n";
   }
+  // Start TBB's worker threads before any memory is measured
+  tbb::parallel_for(0, 1 << 20, [](int) {});
 
   // ============================================================
   // Part 1: Batch Build Test (Build all points at once)
   // ============================================================
   std::cout << "\n=== Part 1: Batch build + 1000 queries ===" << std::endl;
   {
+    const long n = static_cast<long>(pts.size());
     LikdTree likd;
-    IkdTree* ikd = new IkdTree();
+    releaseFreeMemory();
+    MemorySample m0 = MemorySample::now();
     auto t0 = Clock::now();
     likd.build(pts);
     auto t1 = Clock::now();
-    ikd->Build(pts);
+    MemorySample m1 = MemorySample::now();
+    IkdTree* ikd = new IkdTree();  // operation queue allocated here, not counted
+    releaseFreeMemory();
+    MemorySample m2 = MemorySample::now();
     auto t2 = Clock::now();
+    ikd->Build(pts);
+    auto t3 = Clock::now();
+    MemorySample m3 = MemorySample::now();
     std::mt19937 rng(7);
     std::normal_distribution<float> noise(0.0f, 0.05f);
     PointVector<PointType> queries(1000);
@@ -262,9 +403,14 @@ int main(int argc, char** argv) {
     auto q3 = Clock::now();
     ikdKnn(*ikd, queries, K, false);
     auto q4 = Clock::now();
-    printRow("Build", elapsedMs(t0, t1), elapsedMs(t1, t2));
+    printRow("Build", elapsedMs(t0, t1), elapsedMs(t2, t3));
     printRow("1-NN x1000 (seq)", elapsedMs(q0, q1), elapsedMs(q1, q2));
     printRow("5-NN x1000 (seq)", elapsedMs(q2, q3), elapsedMs(q3, q4));
+    printRow("Heap per point", perPoint(m0.heap, m1.heap, n),
+             perPoint(m2.heap, m3.heap, n), "B/pt");
+    printRow("RSS growth per point", perPoint(m0.rss, m1.rss, n),
+             perPoint(m2.rss, m3.rss, n), "B/pt");
+    printLikd("memoryUsage() per point", double(likd.memoryUsage()) / n, "B/pt");
     delete ikd;
   }
 
@@ -274,11 +420,13 @@ int main(int argc, char** argv) {
   std::cout << "\n=== Part 2: Incremental insertion (query, then insert) ==="
             << std::endl;
   runStream(pts, frame, 0.0f);
+  streamMemory(pts, frame, 0.0f);
 
   if (argc > 1) {
     std::cout << "\n=== Part 3: Local map, 100 m cube, box delete every 10 "
                  "frames ===" << std::endl;
     runStream(pts, frame, 50.0f);
+    streamMemory(pts, frame, 50.0f);
   }
   return 0;
 }
