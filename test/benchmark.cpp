@@ -311,8 +311,8 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
     printRow("Box delete total", L.del, I.del);
     printf("  %-28s likd-tree %9d    | ikd-tree %9d\n", "Points kept", likd.size(),
            ikd->validnum());
-    printf("  %-28s likd-tree %9d    | ikd-tree %9d\n", "Nodes held",
-           likd.nodeCount(), ikd->size());
+    printf("  %-28s likd-tree %9d    | ikd-tree %9d\n",
+           "Points stored, incl. deleted", likd.nodeCount(), ikd->size());
   }
   printf("  likd-tree final wait for rebuild: %.2f ms\n", wait_ms);
   printf("  5-NN answers from a map with queued writes (likd-tree): %.3f%%\n",

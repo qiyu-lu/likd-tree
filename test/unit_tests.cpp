@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+// Compiles KDTree::validate()
+#define LIKD_TREE_TESTING
 #include "../src/likd_tree.hpp"
 
 namespace {
@@ -295,10 +297,12 @@ void testDeleteDifferential() {
     }
     if (round % 6 == 5) {
       tree.waitForRebuild();
+      CHECK(tree.validate());
       CHECK(sameAsModel(tree, model, rng));
     }
   }
   tree.waitForRebuild();
+  CHECK(tree.validate());
   CHECK(sameAsModel(tree, model, rng));
   // Rebuilds reclaim deleted points
   CHECK(tree.nodeCount() <= 2 * tree.size() + 64);
@@ -313,6 +317,7 @@ void testDeleteTies() {
   Tree tree;
   tree.build(pts);
   tree.deletePoints(pts, true);
+  CHECK(tree.validate());
   CHECK(tree.size() == 0);
   CHECK(!tree.nearestNeighbors(Pt{0, 0, 0}).first);
 }
@@ -325,6 +330,7 @@ void testDeleteAll() {
   tree.build(blob(rng, 5000));
   tree.deleteBox(typename Tree::AABB({-1e9f, -1e9f, -1e9f}, {1e9f, 1e9f, 1e9f}),
                  true);
+  CHECK(tree.validate());
   CHECK(tree.size() == 0);
   CHECK(tree.nodeCount() == 0);
   CHECK(tree.memoryUsage() == 0);
@@ -358,6 +364,7 @@ void testMemoryUsage() {
   float x90 = xs[xs.size() * 9 / 10];
   tree.deleteBox(typename Tree::AABB({-1e9f, -1e9f, -1e9f}, {x90, 1e9f, 1e9f}),
                  true);
+  CHECK(tree.validate());
   CHECK(tree.size() < static_cast<int>(pts.size()) / 5);
   CHECK(tree.memoryUsage() <= full / 4);
 }
@@ -379,6 +386,7 @@ void testDuplicates() {
   }
   tree.addPoints(Points(150, same), true);
   model.insert(model.end(), 150, same);
+  CHECK(tree.validate());
   CHECK(sameAsModel(tree, model, rng));
   Points res;
   std::vector<float> d;
@@ -392,6 +400,7 @@ void testDuplicates() {
     eraseOne(model, same);
     if (i % 100 == 99) {
       tree.waitForRebuild();
+      CHECK(tree.validate());
       CHECK(sameAsModel(tree, model, rng));
       tree.radiusSearch(same, 0.0f, res, d);
       CHECK(res.size() == static_cast<size_t>(399 - i));
@@ -419,10 +428,12 @@ void testEmptiedLeaves() {
     if (p.x < x30) gone.push_back(p);
   tree.deletePoints(gone, true);
   for (const auto& p : gone) eraseOne(model, p);
+  CHECK(tree.validate());
   CHECK(sameAsModel(tree, model, rng));
   Points back(gone.begin(), gone.begin() + gone.size() / 2);
   tree.addPoints(back, true);
   model.insert(model.end(), back.begin(), back.end());
+  CHECK(tree.validate());
   CHECK(sameAsModel(tree, model, rng));
 }
 
@@ -457,6 +468,7 @@ void testInsertAfterDeletingSubtrees() {
       model.insert(model.end(), more.begin(), more.end());
     }
     tree.waitForRebuild();
+    CHECK(tree.validate());
     CHECK(sameAsModel(tree, model, rng));
     // Kill b again and let the rebuild drop it, then insert where it was
     tree.deleteBox(around_b, true);
@@ -464,7 +476,45 @@ void testInsertAfterDeletingSubtrees() {
     Points more = cluster(rng, 300, b, 2.0f);
     tree.addPoints(more, true);
     model.insert(model.end(), more.begin(), more.end());
+    CHECK(tree.validate());
     CHECK(sameAsModel(tree, model, rng));
+  }
+}
+
+// Random writes, each followed by waiting for the rebuild and a check of the
+// whole tree's structure.
+template <typename Tree>
+void testValidatedRandomWrites() {
+  std::printf("[validated random writes]\n");
+  std::mt19937 rng(17);
+  std::uniform_real_distribution<float> u(-50.0f, 50.0f);
+  Tree tree;
+  Points model = gridBlob(rng, 2000);
+  tree.build(model);
+  CHECK(tree.validate());
+  for (int round = 0; round < 300; ++round) {
+    int kind = rng() % 10;
+    if (kind < 5) {
+      Points b = gridBlob(rng, 50 + rng() % 400);
+      tree.addPoints(b);
+      model.insert(model.end(), b.begin(), b.end());
+    } else if (kind < 8) {
+      Points del;
+      for (int i = 0; i < 100 && !model.empty(); ++i)
+        del.push_back(model[rng() % model.size()]);
+      tree.deletePoints(del);
+      for (const auto& p : del) eraseOne(model, p);
+    } else {
+      float cx = u(rng), cy = u(rng), h = 2.0f + rng() % 15;
+      typename Tree::AABB box({cx - h, cy - h, -100.0f}, {cx + h, cy + h, 100.0f});
+      tree.deleteBox(box);
+      model.erase(std::remove_if(model.begin(), model.end(),
+                                 [&](const Pt& p) { return box.contains(p); }),
+                  model.end());
+    }
+    tree.waitForRebuild();
+    CHECK(tree.validate());
+    if (round % 20 == 19) CHECK(sameAsModel(tree, model, rng));
   }
 }
 
@@ -484,6 +534,7 @@ void testNoPointsLostDuringRebuild() {
       expected += b.size();
     }
     tree.waitForRebuild();
+    CHECK(tree.validate());
     CHECK(tree.size() == static_cast<int>(expected));
   }
 }
@@ -558,6 +609,7 @@ void testConcurrentWriters() {
   }
   for (auto& w : writers) w.join();
   tree.waitForRebuild();
+  CHECK(tree.validate());
   CHECK(tree.size() == static_cast<int>(all.size()));
   CHECK(matchesBruteForce(tree, all, rng, 200));
 }
@@ -608,6 +660,7 @@ void testReadersDuringWritesAndBuild() {
   done = true;
   for (auto& r : readers) r.join();
   tree.waitForRebuild();
+  CHECK(tree.validate());
   CHECK(answered > 0);
   CHECK(tree.size() == static_cast<int>(last.size()));
   CHECK(matchesBruteForce(tree, last, rng, 100));
@@ -626,6 +679,7 @@ void bruteForceTests(const char* label) {
   testDuplicates<Tree>();
   testEmptiedLeaves<Tree>();
   testInsertAfterDeletingSubtrees<Tree>();
+  testValidatedRandomWrites<Tree>();
 }
 
 template <typename Tree>

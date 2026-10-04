@@ -7,6 +7,9 @@ Distributed under MIT license. See LICENSE for more information.
 // likd-tree: A Lightweight Incremental KD-Tree for dynamic point insertion
 // with automatic background rebalancing. Header-only C++17 library.
 //
+// Points live in leaf buckets of up to Options::LEAF_SIZE points; inner nodes
+// only split space. A full leaf splits in two when a point is added to it.
+//
 // Thread safety: queries may run concurrently with each other and with
 // writers. Writers (build / addPoints / deletePoints / deleteBoxes) are
 // serialized internally, so calling them from several threads is safe but
@@ -24,6 +27,7 @@ Distributed under MIT license. See LICENSE for more information.
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <execution>
 #include <limits>
 #include <mutex>
@@ -31,13 +35,13 @@ Distributed under MIT license. See LICENSE for more information.
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 constexpr double KDTREE_ALPHA = 0.75;
-// Rebuild a subtree once more than this fraction of its nodes is deleted
+// Rebuild a subtree once more than this fraction of its points is deleted
 constexpr double KDTREE_DELETE_ALPHA = 0.5;
 constexpr int INSERTION_BATCH_SIZE = 100;
-constexpr int MIN_SUB_NUM = 8;
 // Subtrees larger than this are built with parallel tasks (TBB only)
 constexpr size_t MIN_PARALLEL_BUILD_SIZE = 20000;
 #ifdef LIKD_TREE_USE_TBB
@@ -71,11 +75,17 @@ struct DefaultOptions {
   static constexpr int LEAF_SIZE = 32;
 };
 
+// PointType must be default-constructible and copy-assignable.
 template <typename PointType, typename Traits = PointTraits<PointType>,
           typename Options = DefaultOptions>
 class KDTree {
   static constexpr int LeafSize = Options::LEAF_SIZE;
   static_assert(LeafSize >= 2 && LeafSize <= 64, "LEAF_SIZE must be 2 to 64");
+  // Smaller subtrees are never rebuilt: a few leaves are not worth it
+  static constexpr int MIN_REBUILD_SIZE = 4 * LeafSize;
+  // Points per leaf when building: ceil(0.8 * LeafSize), leaving room to
+  // insert before a leaf splits
+  static constexpr int BUILD_LEAF_POINTS = (4 * LeafSize + 4) / 5;
 
  public:
   struct AABB {
@@ -90,25 +100,6 @@ class KDTree {
     bool contains(const PointType& pt) const;
     bool contains(const AABB& box) const;
     bool intersects(const AABB& box) const;
-  };
-
-  struct Node {
-    Node* left = nullptr;
-    Node* right = nullptr;
-    Node* parent = nullptr;
-    AABB aabb;  // bounds of the non-deleted points in this subtree
-    PointType point;
-    int axis;
-    int subtree_size = 1;  // nodes in this subtree, deleted ones included
-    int valid_size = 1;    // non-deleted points in this subtree
-    bool is_left_child = false;  // true if this is parent's left child
-    bool need_rebuild = false;
-    bool deleted = false;  // this node's point is deleted
-    // Lazy tag: the whole subtree is deleted. Descendants are only updated
-    // when a writer descends here (pushDown); queries never get past a node
-    // with valid_size == 0, so they never see stale descendants.
-    bool tree_deleted = false;
-    Node(const PointType& pt, int ax);
   };
 
   KDTree();
@@ -147,10 +138,10 @@ class KDTree {
   // Number of points that are not deleted. Writes still queued by a running
   // rebuild are not reflected yet.
   int size() const;
-  // Nodes held in memory, including deleted points not yet reclaimed by a
+  // Points held in memory, including deleted points not yet reclaimed by a
   // rebuild.
   int nodeCount() const;
-  // Bytes held by the tree's nodes, deleted ones included, excluding
+  // Bytes held by the tree's nodes, deleted points included, excluding
   // allocator overhead.
   size_t memoryUsage() const;
   // Blocks until the background rebuild, including the writes queued while
@@ -171,7 +162,45 @@ class KDTree {
   RebuildStats rebuildStats() const;
 #endif
 
+#ifdef LIKD_TREE_TESTING
+  // Checks the links, counts, bounds and flags of every node against values
+  // recomputed from scratch. Call it while no rebuild runs, e.g. after
+  // waitForRebuild().
+  bool validate() const;
+#endif
+
  private:
+  using Mask = std::conditional_t<(LeafSize <= 32), uint32_t, uint64_t>;
+
+  struct Node {
+    Node* parent = nullptr;
+    AABB aabb;  // bounds of the non-deleted points in this subtree
+    int size = 0;   // points stored in this subtree, deleted ones included
+    int valid = 0;  // non-deleted points in this subtree
+    bool is_leaf;
+    bool is_left_child = false;  // true if this is parent's left child
+    bool need_rebuild = false;   // inner nodes only
+    // Lazy tag, inner nodes only: the whole subtree is deleted. Descendants
+    // are only updated when a writer descends here (pushDown); queries never
+    // get past a node with valid == 0, so they never see stale descendants.
+    bool tree_deleted = false;
+    explicit Node(bool leaf) : is_leaf(leaf) {}
+  };
+
+  struct Inner : Node {
+    Node* left = nullptr;  // either child may be empty
+    Node* right = nullptr;
+    float split;  // points with coord < split are inserted on the left
+    int axis;
+    Inner(float s, int ax) : Node(false), split(s), axis(ax) {}
+  };
+
+  struct Leaf : Node {
+    Mask deleted = 0;  // bit i: pts[i] is deleted
+    PointType pts[LeafSize];  // the first `size` slots are in use
+    Leaf() : Node(true) {}
+  };
+
   // std::shared_mutex on glibc prefers readers: back-to-back queries from
   // other threads could starve the writers and the rebuild swap forever.
   // New readers therefore wait while a writer is queued.
@@ -204,38 +233,59 @@ class KDTree {
   };
   using OpLog = std::vector<Op, Eigen::aligned_allocator<Op>>;
 
+  static Leaf* asLeaf(Node* n) { return static_cast<Leaf*>(n); }
+  static const Leaf* asLeaf(const Node* n) { return static_cast<const Leaf*>(n); }
+  static Inner* asInner(Node* n) { return static_cast<Inner*>(n); }
+  static const Inner* asInner(const Node* n) {
+    return static_cast<const Inner*>(n);
+  }
+  static Mask bit(int i) { return Mask(1) << i; }
+  // The lowest n bits; n may equal the width of Mask
+  static Mask lowBits(int n) {
+    return n >= static_cast<int>(sizeof(Mask) * 8) ? ~Mask(0) : bit(n) - 1;
+  }
+  // Calls fn(i) for each slot in use whose point is not deleted
+  template <typename Fn>
+  static void forEachValid(const Leaf* leaf, Fn&& fn);
+  static int longestAxis(const AABB& box);
+
   template <typename ApplyFn, typename EnqueueFn>
   void write(ApplyFn&& apply_now, EnqueueFn&& enqueue, bool wait_for_rebuild);
   void applyOp(const Op& op, std::vector<Node*>* candidates);
-  Node* insertInternal(Node* node, const PointType& pt, int depth,
+  Leaf* newLeaf();
+  Inner* newInner(float split, int axis);
+  Node* insertInternal(Node* node, const PointType& pt,
                        std::vector<Node*>* candidates);
+  static void appendPoint(Leaf* leaf, const PointType& pt);
+  Node* makeRoom(Leaf* leaf);
   bool deletePointInternal(Node* node, const PointType& pt,
                            std::vector<Node*>* candidates);
   int deleteBoxInternal(Node* node, const AABB& box,
                         std::vector<Node*>* candidates);
   static void killSubtree(Node* node);
-  static void pushDown(Node* node);
+  static void pushDown(Inner* node);
   static bool samePoint(const PointType& a, const PointType& b);
-  void update(Node* node);
-  bool needRebuild(Node* node) const;
-  void markIfUnbalanced(Node* node, std::vector<Node*>* candidates);
-  void collect(Node* node, PointVector<PointType>& pts) const;
-  static void destroy(Node* node);
+  static void updateLeaf(Leaf* leaf);
+  static void updateInner(Inner* node);
+  bool needRebuild(const Inner* node) const;
+  void markIfUnbalanced(Inner* node, std::vector<Node*>* candidates);
+  void collect(const Node* node, PointVector<PointType>& pts) const;
+  void destroy(Node* node);
   Node* buildRecursive(PointVector<PointType>& pts, size_t l, size_t r);
-  void nearestNeighborInternal(Node* node, const PointType& query,
+  void nearestNeighborInternal(const Node* node, const PointType& query,
                                const PointType*& best_pt,
                                float& best_dist2) const;
-  void radiusSearchInternal(Node* node, const PointType& query, float radius2,
-                            PointVector<PointType>& results,
+  void radiusSearchInternal(const Node* node, const PointType& query,
+                            float radius2, PointVector<PointType>& results,
                             std::vector<float>& distances2) const;
   // best: (squared distance, point), ascending, at most k entries
-  void knnSearchInternal(Node* node, const PointType& query, size_t k,
+  void knnSearchInternal(const Node* node, const PointType& query, size_t k,
                          float max_dist2,
                          std::vector<std::pair<float, const PointType*>>& best) const;
   void knnSearchLocked(const PointType& query, int k, float max_dist,
                        PointVector<PointType>& results,
                        std::vector<float>& distances) const;
-  void boxSearchInternal(Node* node, const AABB& box,
+  void boxSearchInternal(const Node* node, const AABB& box,
                          PointVector<PointType>& results) const;
   bool checkAncestorNeedsRebuild(Node* node) const;
   std::vector<Node*> topmostCandidates(const std::vector<Node*>& candidates) const;
@@ -243,6 +293,9 @@ class KDTree {
   void workerLoop();
 
   Node* root_ = nullptr;
+  // Nodes allocated, for memoryUsage(). Parallel builds allocate concurrently.
+  std::atomic<size_t> leaf_count_{0};
+  std::atomic<size_t> inner_count_{0};
   mutable SharedMutex tree_mutex_;
   // Serializes writers.
   std::mutex write_mutex_;
@@ -333,12 +386,6 @@ bool KDTree<PointType, Traits, Options>::AABB::intersects(const AABB& box) const
       return false;
   }
   return true;
-}
-
-template <typename PointType, typename Traits, typename Options>
-KDTree<PointType, Traits, Options>::Node::Node(const PointType& pt, int ax)
-    : point(pt), axis(ax) {
-  aabb.expand(pt);
 }
 
 template <typename PointType, typename Traits, typename Options>
@@ -434,7 +481,7 @@ void KDTree<PointType, Traits, Options>::addPoints(const PointVector<PointType>&
   write(
       [&](std::vector<Node*>* candidates) {
         for (const auto& p : pts) {
-          root_ = insertInternal(root_, p, 0, candidates);
+          root_ = insertInternal(root_, p, candidates);
         }
       },
       [&](OpLog& ops) {
@@ -490,7 +537,7 @@ std::pair<std::optional<PointType>, float>
 KDTree<PointType, Traits, Options>::nearestNeighbors(const PointType& query) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
 
-  if (root_ == nullptr || root_->valid_size == 0) {
+  if (root_ == nullptr || root_->valid == 0) {
     return {std::nullopt, INFINITY};
   }
 
@@ -510,7 +557,7 @@ void KDTree<PointType, Traits, Options>::nearestNeighbors(
   distances.assign(queries.size(), INFINITY);
 
   // If tree is empty, all queries return INFINITY distance
-  if (root_ == nullptr || root_->valid_size == 0) {
+  if (root_ == nullptr || root_->valid == 0) {
     return;
   }
 
@@ -607,7 +654,7 @@ void KDTree<PointType, Traits, Options>::knnSearchLocked(
     PointVector<PointType>& results, std::vector<float>& distances) const {
   results.clear();
   distances.clear();
-  if (k <= 0 || root_ == nullptr || root_->valid_size == 0 || max_dist < 0.0f) {
+  if (k <= 0 || root_ == nullptr || root_->valid == 0 || max_dist < 0.0f) {
     return;
   }
   const float max_dist2 = std::isinf(max_dist) ? INFINITY : max_dist * max_dist;
@@ -636,19 +683,19 @@ void KDTree<PointType, Traits, Options>::boxSearch(const AABB& box,
 template <typename PointType, typename Traits, typename Options>
 int KDTree<PointType, Traits, Options>::size() const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
-  return root_ ? root_->valid_size : 0;
+  return root_ ? root_->valid : 0;
 }
 
 template <typename PointType, typename Traits, typename Options>
 int KDTree<PointType, Traits, Options>::nodeCount() const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
-  return root_ ? root_->subtree_size : 0;
+  return root_ ? root_->size : 0;
 }
 
 template <typename PointType, typename Traits, typename Options>
 size_t KDTree<PointType, Traits, Options>::memoryUsage() const {
-  std::shared_lock<SharedMutex> lock(tree_mutex_);
-  return root_ ? static_cast<size_t>(root_->subtree_size) * sizeof(Node) : 0;
+  return leaf_count_.load(std::memory_order_relaxed) * sizeof(Leaf) +
+         inner_count_.load(std::memory_order_relaxed) * sizeof(Inner);
 }
 
 template <typename PointType, typename Traits, typename Options>
@@ -666,12 +713,97 @@ KDTree<PointType, Traits, Options>::rebuildStats() const {
 }
 #endif
 
+#ifdef LIKD_TREE_TESTING
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::validate() const {
+  std::shared_lock<SharedMutex> lock(tree_mutex_);
+  auto same_box = [](const AABB& a, const AABB& b) {
+    return a.min == b.min && a.max == b.max;
+  };
+  bool ok = !root_ || (root_->parent == nullptr && !root_->is_left_child);
+  size_t leaves = 0, inners = 0;
+  // (node, below a tree_deleted tag: its counts and bounds are stale)
+  std::vector<std::pair<const Node*, bool>> stack;
+  if (root_)
+    stack.push_back({root_, false});
+  while (!stack.empty()) {
+    auto [n, stale] = stack.back();
+    stack.pop_back();
+    // Every candidate is rebuilt, or freed with an ancestor, before the
+    // worker goes idle
+    ok = ok && !n->need_rebuild;
+    if (n->is_leaf) {
+      ++leaves;
+      const Leaf* leaf = asLeaf(n);
+      ok = ok && !leaf->tree_deleted && leaf->size >= 0 &&
+           leaf->size <= LeafSize && (leaf->deleted & ~lowBits(leaf->size)) == 0;
+      if (!stale) {
+        int valid = 0;
+        AABB box;
+        forEachValid(leaf, [&](int i) {
+          ++valid;
+          box.expand(leaf->pts[i]);
+        });
+        ok = ok && leaf->valid == valid && same_box(leaf->aabb, box);
+      }
+      continue;
+    }
+    ++inners;
+    const Inner* inner = asInner(n);
+    int size = 0, valid = 0;
+    AABB box;
+    for (const Node* child : {inner->left, inner->right}) {
+      if (!child)
+        continue;
+      ok = ok && child->parent == inner &&
+           child->is_left_child == (child == inner->left);
+      size += child->size;
+      if (child->valid > 0) {
+        valid += child->valid;
+        box.expand(child->aabb);
+      }
+      stack.push_back({child, stale || inner->tree_deleted});
+    }
+    ok = ok && inner->size == size;
+    if (inner->tree_deleted)
+      ok = ok && inner->valid == 0;
+    else if (!stale)
+      ok = ok && inner->valid == valid && same_box(inner->aabb, box);
+  }
+  return ok && leaves == leaf_count_.load() && inners == inner_count_.load();
+}
+#endif
+
+template <typename PointType, typename Traits, typename Options>
+template <typename Fn>
+void KDTree<PointType, Traits, Options>::forEachValid(const Leaf* leaf, Fn&& fn) {
+  if (leaf->deleted == 0) {
+    for (int i = 0; i < leaf->size; ++i)
+      fn(i);
+  } else {
+    for (int i = 0; i < leaf->size; ++i) {
+      if (!(leaf->deleted & bit(i)))
+        fn(i);
+    }
+  }
+}
+
+template <typename PointType, typename Traits, typename Options>
+int KDTree<PointType, Traits, Options>::longestAxis(const AABB& box) {
+  int axis = 0;
+  for (int a = 1; a < Traits::DIM; ++a) {
+    if (box.max[a] - box.min[a] > box.max[axis] - box.min[axis])
+      axis = a;
+  }
+  return axis;
+}
+
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::applyOp(const Op& op,
                                         std::vector<Node*>* candidates) {
   switch (op.type) {
     case OpType::kInsert:
-      root_ = insertInternal(root_, op.point, 0, candidates);
+      root_ = insertInternal(root_, op.point, candidates);
       break;
     case OpType::kDeletePoint:
       deletePointInternal(root_, op.point, candidates);
@@ -683,28 +815,103 @@ void KDTree<PointType, Traits, Options>::applyOp(const Op& op,
 }
 
 template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::Leaf*
+KDTree<PointType, Traits, Options>::newLeaf() {
+  leaf_count_.fetch_add(1, std::memory_order_relaxed);
+  return new Leaf();
+}
+
+template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::Inner*
+KDTree<PointType, Traits, Options>::newInner(float split, int axis) {
+  inner_count_.fetch_add(1, std::memory_order_relaxed);
+  return new Inner(split, axis);
+}
+
+// Inserts pt below node and returns the subtree's root, which is new if the
+// subtree was empty or its root was a full leaf that split.
+template <typename PointType, typename Traits, typename Options>
 typename KDTree<PointType, Traits, Options>::Node*
 KDTree<PointType, Traits, Options>::insertInternal(Node* node, const PointType& pt,
-                                          int depth,
                                           std::vector<Node*>* candidates) {
-  if (!node)
-    return new Node(pt, depth % Traits::DIM);
-  pushDown(node);
-  int ax = node->axis;
-  float v = Traits::coord(pt, ax);
-  float nv = Traits::coord(node->point, ax);
-  if (v < nv) {
-    node->left = insertInternal(node->left, pt, depth + 1, candidates);
-    node->left->parent = node;
-    node->left->is_left_child = true;
-  } else {
-    node->right = insertInternal(node->right, pt, depth + 1, candidates);
-    node->right->parent = node;
-    node->right->is_left_child = false;
+  if (!node) {
+    Leaf* leaf = newLeaf();
+    appendPoint(leaf, pt);
+    return leaf;
   }
-  update(node);
-  markIfUnbalanced(node, candidates);
-  return node;
+  if (node->is_leaf) {
+    Leaf* leaf = asLeaf(node);
+    if (leaf->size == LeafSize)
+      node = makeRoom(leaf);
+    if (node->is_leaf) {
+      appendPoint(asLeaf(node), pt);
+      return node;
+    }
+  }
+  Inner* inner = asInner(node);
+  pushDown(inner);
+  bool left = Traits::coord(pt, inner->axis) < inner->split;
+  Node*& child = left ? inner->left : inner->right;
+  child = insertInternal(child, pt, candidates);
+  child->parent = inner;
+  child->is_left_child = left;
+  updateInner(inner);
+  markIfUnbalanced(inner, candidates);
+  return inner;
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::appendPoint(Leaf* leaf, const PointType& pt) {
+  leaf->pts[leaf->size++] = pt;
+  ++leaf->valid;
+  leaf->aabb.expand(pt);
+}
+
+// Makes room in a full leaf and returns what takes its place, which the
+// caller links in. Normally the leaf splits at the median of its points along
+// their longest extent: it keeps the lower half, a new leaf takes the upper
+// half, a new inner node holds both, and deleted slots are dropped. With
+// fewer than two points left there is nothing to split: the leaf itself is
+// returned, compacted.
+template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::Node*
+KDTree<PointType, Traits, Options>::makeRoom(Leaf* leaf) {
+  PointType kept[LeafSize];
+  int n = 0;
+  forEachValid(leaf, [&](int i) { kept[n++] = leaf->pts[i]; });
+  if (n < 2) {
+    std::copy(kept, kept + n, leaf->pts);
+    leaf->size = n;
+    leaf->deleted = 0;
+    updateLeaf(leaf);
+    return leaf;
+  }
+  // The leaf's bounds cover exactly the points kept
+  int axis = longestAxis(leaf->aabb);
+  int m = n / 2;
+  std::nth_element(kept, kept + m, kept + n,
+                   [axis](const PointType& a, const PointType& b) {
+                     return Traits::coord(a, axis) < Traits::coord(b, axis);
+                   });
+  Inner* inner = newInner(Traits::coord(kept[m], axis), axis);
+  Leaf* upper = newLeaf();
+  std::copy(kept, kept + m, leaf->pts);
+  leaf->size = m;
+  leaf->deleted = 0;
+  updateLeaf(leaf);
+  std::copy(kept + m, kept + n, upper->pts);
+  upper->size = n - m;
+  updateLeaf(upper);
+  inner->parent = leaf->parent;
+  inner->is_left_child = leaf->is_left_child;
+  inner->left = leaf;
+  inner->right = upper;
+  leaf->parent = inner;
+  leaf->is_left_child = true;
+  upper->parent = inner;
+  upper->is_left_child = false;
+  updateInner(inner);
+  return inner;
 }
 
 // Descends by bounding box rather than by the split comparison: nth_element
@@ -713,64 +920,83 @@ KDTree<PointType, Traits, Options>::insertInternal(Node* node, const PointType& 
 template <typename PointType, typename Traits, typename Options>
 bool KDTree<PointType, Traits, Options>::deletePointInternal(
     Node* node, const PointType& pt, std::vector<Node*>* candidates) {
-  if (!node || node->valid_size == 0 || !node->aabb.contains(pt))
+  if (!node || node->valid == 0 || !node->aabb.contains(pt))
     return false;
-  bool found = false;
-  if (!node->deleted && samePoint(node->point, pt)) {
-    node->deleted = true;
-    found = true;
-  } else {
-    found = deletePointInternal(node->left, pt, candidates) ||
-            deletePointInternal(node->right, pt, candidates);
+  if (node->is_leaf) {
+    Leaf* leaf = asLeaf(node);
+    for (int i = 0; i < leaf->size; ++i) {
+      if (!(leaf->deleted & bit(i)) && samePoint(leaf->pts[i], pt)) {
+        leaf->deleted |= bit(i);
+        updateLeaf(leaf);
+        return true;
+      }
+    }
+    return false;
   }
-  if (found) {
-    update(node);
-    markIfUnbalanced(node, candidates);
-  }
-  return found;
+  Inner* inner = asInner(node);
+  if (!deletePointInternal(inner->left, pt, candidates) &&
+      !deletePointInternal(inner->right, pt, candidates))
+    return false;
+  updateInner(inner);
+  markIfUnbalanced(inner, candidates);
+  return true;
 }
 
 // Returns the number of points deleted
 template <typename PointType, typename Traits, typename Options>
 int KDTree<PointType, Traits, Options>::deleteBoxInternal(
     Node* node, const AABB& box, std::vector<Node*>* candidates) {
-  if (!node || node->valid_size == 0 || !box.intersects(node->aabb))
+  if (!node || node->valid == 0 || !box.intersects(node->aabb))
     return 0;
   if (box.contains(node->aabb)) {
     // Whole subtree inside: tag it in O(1). A dead subtree that is large
     // enough is rebuilt to nothing, which frees its nodes.
-    int removed = node->valid_size;
+    int removed = node->valid;
     killSubtree(node);
-    markIfUnbalanced(node, candidates);
+    if (!node->is_leaf)
+      markIfUnbalanced(asInner(node), candidates);
     return removed;
   }
   int removed = 0;
-  if (!node->deleted && box.contains(node->point)) {
-    node->deleted = true;
-    ++removed;
+  if (node->is_leaf) {
+    Leaf* leaf = asLeaf(node);
+    for (int i = 0; i < leaf->size; ++i) {
+      if (!(leaf->deleted & bit(i)) && box.contains(leaf->pts[i])) {
+        leaf->deleted |= bit(i);
+        ++removed;
+      }
+    }
+    if (removed > 0)
+      updateLeaf(leaf);
+    return removed;
   }
-  removed += deleteBoxInternal(node->left, box, candidates);
-  removed += deleteBoxInternal(node->right, box, candidates);
+  Inner* inner = asInner(node);
+  removed += deleteBoxInternal(inner->left, box, candidates);
+  removed += deleteBoxInternal(inner->right, box, candidates);
   if (removed > 0) {
-    update(node);
-    markIfUnbalanced(node, candidates);
+    updateInner(inner);
+    markIfUnbalanced(inner, candidates);
   }
   return removed;
 }
 
+// Deletes every point below node in O(1): a leaf marks all its slots, an
+// inner node gets the lazy tag.
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::killSubtree(Node* node) {
-  node->tree_deleted = true;
-  node->valid_size = 0;
+  if (node->is_leaf)
+    asLeaf(node)->deleted = lowBits(node->size);
+  else
+    node->tree_deleted = true;
+  node->valid = 0;
   node->aabb = AABB();
 }
 
 // Called by writers before descending into a node
 template <typename PointType, typename Traits, typename Options>
-void KDTree<PointType, Traits, Options>::pushDown(Node* node) {
+void KDTree<PointType, Traits, Options>::pushDown(Inner* node) {
   if (!node->tree_deleted)
     return;
-  node->deleted = true;
   if (node->left)
     killSubtree(node->left);
   if (node->right)
@@ -789,48 +1015,48 @@ bool KDTree<PointType, Traits, Options>::samePoint(const PointType& a,
 }
 
 template <typename PointType, typename Traits, typename Options>
-void KDTree<PointType, Traits, Options>::update(Node* node) {
-  node->subtree_size = 1;
-  if (node->left) {
-    node->subtree_size += node->left->subtree_size;
-  }
-  if (node->right) {
-    node->subtree_size += node->right->subtree_size;
-  }
+void KDTree<PointType, Traits, Options>::updateLeaf(Leaf* leaf) {
+  leaf->valid = 0;
+  leaf->aabb = AABB();
+  forEachValid(leaf, [&](int i) {
+    ++leaf->valid;
+    leaf->aabb.expand(leaf->pts[i]);
+  });
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::updateInner(Inner* node) {
+  node->size = 0;
+  node->valid = 0;
   node->aabb = AABB();
-  if (node->tree_deleted) {
-    node->valid_size = 0;
-    return;
-  }
-  node->valid_size = node->deleted ? 0 : 1;
-  if (!node->deleted) {
-    node->aabb.expand(node->point);
-  }
   for (Node* child : {node->left, node->right}) {
-    if (child && child->valid_size > 0) {
-      node->valid_size += child->valid_size;
+    if (!child)
+      continue;
+    node->size += child->size;
+    if (!node->tree_deleted && child->valid > 0) {
+      node->valid += child->valid;
       node->aabb.expand(child->aabb);
     }
   }
 }
 
 template <typename PointType, typename Traits, typename Options>
-bool KDTree<PointType, Traits, Options>::needRebuild(Node* node) const {
-  if (node->subtree_size < MIN_SUB_NUM)
+bool KDTree<PointType, Traits, Options>::needRebuild(const Inner* node) const {
+  if (node->size < MIN_REBUILD_SIZE)
     return false;
-  int lsz = node->left ? node->left->subtree_size : 0;
-  int rsz = node->right ? node->right->subtree_size : 0;
+  int lsz = node->left ? node->left->size : 0;
+  int rsz = node->right ? node->right->size : 0;
   int maxsz = std::max(lsz, rsz);
-  int deleted = node->subtree_size - node->valid_size;
-  return maxsz > KDTREE_ALPHA * node->subtree_size ||
-         deleted > KDTREE_DELETE_ALPHA * node->subtree_size;
+  int deleted = node->size - node->valid;
+  return maxsz > KDTREE_ALPHA * node->size ||
+         deleted > KDTREE_DELETE_ALPHA * node->size;
 }
 
 // Only set need_rebuild to true, never clear it
 // Only delete a node marked by need_rebuild in rebuilding thread
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::markIfUnbalanced(
-    Node* node, std::vector<Node*>* candidates) {
+    Inner* node, std::vector<Node*>* candidates) {
   if (candidates && !node->need_rebuild && needRebuild(node)) {
     node->need_rebuild = true;
     candidates->push_back(node);
@@ -840,25 +1066,31 @@ void KDTree<PointType, Traits, Options>::markIfUnbalanced(
 // Appends the non-deleted points. Iterative: an unbalanced chain must not
 // overflow the stack.
 template <typename PointType, typename Traits, typename Options>
-void KDTree<PointType, Traits, Options>::collect(Node* node,
+void KDTree<PointType, Traits, Options>::collect(const Node* node,
                                         PointVector<PointType>& pts) const {
   if (!node)
     return;
-  std::vector<Node*> stack{node};
+  std::vector<const Node*> stack{node};
   while (!stack.empty()) {
-    Node* n = stack.back();
+    const Node* n = stack.back();
     stack.pop_back();
-    if (n->valid_size == 0)
+    if (n->valid == 0)
       continue;
-    if (!n->deleted)
-      pts.push_back(n->point);
-    if (n->left)
-      stack.push_back(n->left);
-    if (n->right)
-      stack.push_back(n->right);
+    if (n->is_leaf) {
+      const Leaf* leaf = asLeaf(n);
+      forEachValid(leaf, [&](int i) { pts.push_back(leaf->pts[i]); });
+    } else {
+      const Inner* inner = asInner(n);
+      if (inner->left)
+        stack.push_back(inner->left);
+      if (inner->right)
+        stack.push_back(inner->right);
+    }
   }
 }
 
+// Iterative, like collect. Node has no virtual destructor, so each node is
+// deleted as its real type.
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::destroy(Node* node) {
   std::vector<Node*> stack;
@@ -867,11 +1099,18 @@ void KDTree<PointType, Traits, Options>::destroy(Node* node) {
   while (!stack.empty()) {
     Node* n = stack.back();
     stack.pop_back();
-    if (n->left)
-      stack.push_back(n->left);
-    if (n->right)
-      stack.push_back(n->right);
-    delete n;
+    if (n->is_leaf) {
+      delete asLeaf(n);
+      leaf_count_.fetch_sub(1, std::memory_order_relaxed);
+    } else {
+      Inner* inner = asInner(n);
+      if (inner->left)
+        stack.push_back(inner->left);
+      if (inner->right)
+        stack.push_back(inner->right);
+      delete inner;
+      inner_count_.fetch_sub(1, std::memory_order_relaxed);
+    }
   }
 }
 
@@ -881,116 +1120,135 @@ KDTree<PointType, Traits, Options>::buildRecursive(PointVector<PointType>& pts, 
                                           size_t r) {
   if (l >= r)
     return nullptr;
+  const size_t n = r - l;
+  if (n <= static_cast<size_t>(LeafSize)) {
+    Leaf* leaf = newLeaf();
+    std::copy(pts.begin() + l, pts.begin() + r, leaf->pts);
+    leaf->size = static_cast<int>(n);
+    updateLeaf(leaf);
+    return leaf;
+  }
+  // Aim for leaves of BUILD_LEAF_POINTS points: split into `leaves` of them
+  // and give the left side leaves / 2 of those. Unlike a median split, the
+  // fill rate then does not swing between 50% and 100% with the point count.
+  // An odd leaf count makes the sides uneven, at worst 1:2 for three leaves,
+  // which only happens below MIN_REBUILD_SIZE; from five leaves on the
+  // larger side holds less than 3/5 + 1/n. A new subtree is never
+  // unbalanced.
+  const size_t target = BUILD_LEAF_POINTS;
+  const size_t leaves = std::max<size_t>(2, (n + target - 1) / target);
+  const size_t m = l + n * (leaves / 2) / leaves;
   // Split along the longest extent rather than cycling the axes: LiDAR maps
   // are flat, and z splits near the top of the tree prune poorly.
   AABB box;
   for (size_t i = l; i < r; ++i) {
     box.expand(pts[i]);
   }
-  int axis = 0;
-  for (int a = 1; a < Traits::DIM; ++a) {
-    if (box.max[a] - box.min[a] > box.max[axis] - box.min[axis])
-      axis = a;
-  }
-  size_t m = l + (r - l) / 2;
+  int axis = longestAxis(box);
   std::nth_element(pts.begin() + l, pts.begin() + m, pts.begin() + r,
                    [&](const PointType& a, const PointType& b) {
                      return Traits::coord(a, axis) < Traits::coord(b, axis);
                    });
-  Node* node = new Node(pts[m], axis);
+  Inner* node = newInner(Traits::coord(pts[m], axis), axis);
+  // Both sides hold at least one point: n > LeafSize >= 2
 #ifdef LIKD_TREE_USE_TBB
   if (r - l > MIN_PARALLEL_BUILD_SIZE) {
     tbb::parallel_invoke([&] { node->left = buildRecursive(pts, l, m); },
-                         [&] { node->right = buildRecursive(pts, m + 1, r); });
+                         [&] { node->right = buildRecursive(pts, m, r); });
   } else
 #endif
   {
     node->left = buildRecursive(pts, l, m);
-    node->right = buildRecursive(pts, m + 1, r);
+    node->right = buildRecursive(pts, m, r);
   }
-  if (node->left) {
-    node->left->parent = node;
-    node->left->is_left_child = true;
-  }
-  if (node->right) {
-    node->right->parent = node;
-    node->right->is_left_child = false;
-  }
-  update(node);
+  node->left->parent = node;
+  node->left->is_left_child = true;
+  node->right->parent = node;
+  node->right->is_left_child = false;
+  updateInner(node);
   return node;
 }
 
-// Called only on nodes with valid_size > 0
+// Called only on nodes with valid > 0
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::nearestNeighborInternal(
-    Node* node, const PointType& query, const PointType*& best_pt,
+    const Node* node, const PointType& query, const PointType*& best_pt,
     float& best_dist2) const {
-  if (!node->deleted) {
-    float d2 = Traits::sqrDist(node->point, query);
-    if (d2 < best_dist2) {
-      best_dist2 = d2;
-      best_pt = &node->point;
-    }
+  if (node->is_leaf) {
+    const Leaf* leaf = asLeaf(node);
+    forEachValid(leaf, [&](int i) {
+      float d2 = Traits::sqrDist(leaf->pts[i], query);
+      if (d2 < best_dist2) {
+        best_dist2 = d2;
+        best_pt = &leaf->pts[i];
+      }
+    });
+    return;
   }
-  int ax = node->axis;
-  float qv = Traits::coord(query, ax);
-  float nv = Traits::coord(node->point, ax);
-  Node* near = qv < nv ? node->left : node->right;
-  Node* far = qv < nv ? node->right : node->left;
-  if (near && near->valid_size > 0 && near->aabb.sqrDist(query) < best_dist2)
+  const Inner* inner = asInner(node);
+  bool left_first = Traits::coord(query, inner->axis) < inner->split;
+  const Node* near = left_first ? inner->left : inner->right;
+  const Node* far = left_first ? inner->right : inner->left;
+  if (near && near->valid > 0 && near->aabb.sqrDist(query) < best_dist2)
     nearestNeighborInternal(near, query, best_pt, best_dist2);
-  if (far && far->valid_size > 0 && far->aabb.sqrDist(query) < best_dist2)
+  if (far && far->valid > 0 && far->aabb.sqrDist(query) < best_dist2)
     nearestNeighborInternal(far, query, best_pt, best_dist2);
 }
 
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::radiusSearchInternal(
-    Node* node, const PointType& query, float radius2,
+    const Node* node, const PointType& query, float radius2,
     PointVector<PointType>& results, std::vector<float>& distances2) const {
-  if (!node || node->valid_size == 0 || node->aabb.sqrDist(query) > radius2)
+  if (!node || node->valid == 0 || node->aabb.sqrDist(query) > radius2)
     return;
-
-  if (!node->deleted) {
-    float d2 = Traits::sqrDist(node->point, query);
-    if (d2 <= radius2) {
-      results.push_back(node->point);
-      distances2.push_back(d2);
-    }
+  if (node->is_leaf) {
+    const Leaf* leaf = asLeaf(node);
+    forEachValid(leaf, [&](int i) {
+      float d2 = Traits::sqrDist(leaf->pts[i], query);
+      if (d2 <= radius2) {
+        results.push_back(leaf->pts[i]);
+        distances2.push_back(d2);
+      }
+    });
+    return;
   }
-
-  radiusSearchInternal(node->left, query, radius2, results, distances2);
-  radiusSearchInternal(node->right, query, radius2, results, distances2);
+  const Inner* inner = asInner(node);
+  radiusSearchInternal(inner->left, query, radius2, results, distances2);
+  radiusSearchInternal(inner->right, query, radius2, results, distances2);
 }
 
-// Called only on nodes with valid_size > 0
+// Called only on nodes with valid > 0
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::knnSearchInternal(
-    Node* node, const PointType& query, size_t k, float max_dist2,
+    const Node* node, const PointType& query, size_t k, float max_dist2,
     std::vector<std::pair<float, const PointType*>>& best) const {
-  if (!node->deleted) {
-    float d2 = Traits::sqrDist(node->point, query);
-    if (d2 <= max_dist2 && (best.size() < k || d2 < best.back().first)) {
-      if (best.size() == k)
-        best.pop_back();
-      auto pos = std::upper_bound(
-          best.begin(), best.end(), d2,
-          [](float v, const std::pair<float, const PointType*>& e) {
-            return v < e.first;
-          });
-      best.insert(pos, {d2, &node->point});
-    }
+  if (node->is_leaf) {
+    const Leaf* leaf = asLeaf(node);
+    forEachValid(leaf, [&](int i) {
+      float d2 = Traits::sqrDist(leaf->pts[i], query);
+      if (d2 <= max_dist2 && (best.size() < k || d2 < best.back().first)) {
+        if (best.size() == k)
+          best.pop_back();
+        auto pos = std::upper_bound(
+            best.begin(), best.end(), d2,
+            [](float v, const std::pair<float, const PointType*>& e) {
+              return v < e.first;
+            });
+        best.insert(pos, {d2, &leaf->pts[i]});
+      }
+    });
+    return;
   }
-  int ax = node->axis;
-  float qv = Traits::coord(query, ax);
-  float nv = Traits::coord(node->point, ax);
-  Node* near = qv < nv ? node->left : node->right;
-  Node* far = qv < nv ? node->right : node->left;
+  const Inner* inner = asInner(node);
+  bool left_first = Traits::coord(query, inner->axis) < inner->split;
+  const Node* near = left_first ? inner->left : inner->right;
+  const Node* far = left_first ? inner->right : inner->left;
   // Search radius: the k-th best so far, or max_dist until k are found
-  if (near && near->valid_size > 0 &&
+  if (near && near->valid > 0 &&
       near->aabb.sqrDist(query) <=
           (best.size() < k ? max_dist2 : best.back().first))
     knnSearchInternal(near, query, k, max_dist2, best);
-  if (far && far->valid_size > 0 &&
+  if (far && far->valid > 0 &&
       far->aabb.sqrDist(query) <=
           (best.size() < k ? max_dist2 : best.back().first))
     knnSearchInternal(far, query, k, max_dist2, best);
@@ -998,19 +1256,25 @@ void KDTree<PointType, Traits, Options>::knnSearchInternal(
 
 template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::boxSearchInternal(
-    Node* node, const AABB& box, PointVector<PointType>& results) const {
-  if (!node || node->valid_size == 0 || !box.intersects(node->aabb))
+    const Node* node, const AABB& box, PointVector<PointType>& results) const {
+  if (!node || node->valid == 0 || !box.intersects(node->aabb))
     return;
   if (box.contains(node->aabb)) {
     // Whole subtree inside: no per-point test needed
     collect(node, results);
     return;
   }
-  if (!node->deleted && box.contains(node->point)) {
-    results.push_back(node->point);
+  if (node->is_leaf) {
+    const Leaf* leaf = asLeaf(node);
+    forEachValid(leaf, [&](int i) {
+      if (box.contains(leaf->pts[i]))
+        results.push_back(leaf->pts[i]);
+    });
+    return;
   }
-  boxSearchInternal(node->left, box, results);
-  boxSearchInternal(node->right, box, results);
+  const Inner* inner = asInner(node);
+  boxSearchInternal(inner->left, box, results);
+  boxSearchInternal(inner->right, box, results);
 }
 
 template <typename PointType, typename Traits, typename Options>
@@ -1057,7 +1321,7 @@ void KDTree<PointType, Traits, Options>::rebuildSubtrees(
   std::for_each(TREE_PAR, indices.begin(), indices.end(), [&](size_t i) {
     // Deleted points are dropped; a fully deleted subtree becomes nullptr
     PointVector<PointType> pts;
-    pts.reserve(nodes_to_rebuild[i]->valid_size);
+    pts.reserve(nodes_to_rebuild[i]->valid);
     collect(nodes_to_rebuild[i], pts);
     new_nodes[i] = buildRecursive(pts, 0, pts.size());
   });
@@ -1078,17 +1342,17 @@ void KDTree<PointType, Traits, Options>::rebuildSubtrees(
       // Update parent's pointer to new subtree
       if (parent) {
         if (old_node->is_left_child) {
-          parent->left = new_node;
+          asInner(parent)->left = new_node;
         } else {
-          parent->right = new_node;
+          asInner(parent)->right = new_node;
         }
       } else {
         // This was the root
         root_ = new_node;
       }
-      // Deleted nodes are gone: shrink the ancestors' node counts
+      // Deleted points are gone: shrink the ancestors' counts
       for (Node* ancestor = parent; ancestor; ancestor = ancestor->parent) {
-        update(ancestor);
+        updateInner(asInner(ancestor));
       }
     }
   }
