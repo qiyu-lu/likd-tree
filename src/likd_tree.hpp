@@ -58,9 +58,15 @@ class KDTree {
   struct AABB {
     std::array<float, Traits::DIM> min, max;
     AABB();
+    AABB(const std::array<float, Traits::DIM>& min_corner,
+         const std::array<float, Traits::DIM>& max_corner);
     void expand(const PointType& pt);
     void expand(const AABB& box);
     float sqrDist(const PointType& pt) const;
+    // Closed intervals: points on the boundary are inside.
+    bool contains(const PointType& pt) const;
+    bool contains(const AABB& box) const;
+    bool intersects(const AABB& box) const;
   };
 
   struct Node {
@@ -91,6 +97,18 @@ class KDTree {
   void radiusSearch(const PointType& query, float radius,
                     PointVector<PointType>& results,
                     std::vector<float>& distances) const;
+  // k nearest neighbors sorted by distance. Fewer than k are returned if the
+  // tree is smaller or max_dist excludes the rest.
+  void knnSearch(const PointType& query, int k, PointVector<PointType>& results,
+                 std::vector<float>& distances,
+                 float max_dist = INFINITY) const;
+  // Batch version; queries run in parallel with LIKD_TREE_USE_TBB.
+  void knnSearch(const PointVector<PointType>& queries, int k,
+                 std::vector<PointVector<PointType>>& results,
+                 std::vector<std::vector<float>>& distances,
+                 float max_dist = INFINITY) const;
+  // All points inside the box (boundary included), in no particular order.
+  void boxSearch(const AABB& box, PointVector<PointType>& results) const;
   // Points still buffered by a running rebuild are not counted.
   int size() const;
   // Blocks until the background rebuild, including the insertion of points
@@ -135,6 +153,15 @@ class KDTree {
   void radiusSearchInternal(Node* node, const PointType& query, float radius2,
                             PointVector<PointType>& results,
                             std::vector<float>& distances2) const;
+  // best: (squared distance, point), ascending, at most k entries
+  void knnSearchInternal(Node* node, const PointType& query, size_t k,
+                         float max_dist2,
+                         std::vector<std::pair<float, const PointType*>>& best) const;
+  void knnSearchLocked(const PointType& query, int k, float max_dist,
+                       PointVector<PointType>& results,
+                       std::vector<float>& distances) const;
+  void boxSearchInternal(Node* node, const AABB& box,
+                         PointVector<PointType>& results) const;
   bool checkAncestorNeedsRebuild(Node* node) const;
   std::vector<Node*> topmostCandidates(const std::vector<Node*>& candidates) const;
   void rebuildSubtrees(const std::vector<Node*>& nodes_to_rebuild);
@@ -165,6 +192,12 @@ KDTree<PointType, Traits>::AABB::AABB() {
 }
 
 template <typename PointType, typename Traits>
+KDTree<PointType, Traits>::AABB::AABB(
+    const std::array<float, Traits::DIM>& min_corner,
+    const std::array<float, Traits::DIM>& max_corner)
+    : min(min_corner), max(max_corner) {}
+
+template <typename PointType, typename Traits>
 void KDTree<PointType, Traits>::AABB::expand(const PointType& pt) {
   for (int i = 0; i < Traits::DIM; ++i) {
     min[i] = std::min(min[i], Traits::coord(pt, i));
@@ -191,6 +224,34 @@ float KDTree<PointType, Traits>::AABB::sqrDist(const PointType& pt) const {
       d2 += (v - max[i]) * (v - max[i]);
   }
   return d2;
+}
+
+template <typename PointType, typename Traits>
+bool KDTree<PointType, Traits>::AABB::contains(const PointType& pt) const {
+  for (int i = 0; i < Traits::DIM; ++i) {
+    float v = Traits::coord(pt, i);
+    if (v < min[i] || v > max[i])
+      return false;
+  }
+  return true;
+}
+
+template <typename PointType, typename Traits>
+bool KDTree<PointType, Traits>::AABB::contains(const AABB& box) const {
+  for (int i = 0; i < Traits::DIM; ++i) {
+    if (box.min[i] < min[i] || box.max[i] > max[i])
+      return false;
+  }
+  return true;
+}
+
+template <typename PointType, typename Traits>
+bool KDTree<PointType, Traits>::AABB::intersects(const AABB& box) const {
+  for (int i = 0; i < Traits::DIM; ++i) {
+    if (box.max[i] < min[i] || box.min[i] > max[i])
+      return false;
+  }
+  return true;
 }
 
 template <typename PointType, typename Traits>
@@ -369,6 +430,64 @@ void KDTree<PointType, Traits>::radiusSearch(
 }
 
 template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::knnSearch(const PointType& query, int k,
+                                          PointVector<PointType>& results,
+                                          std::vector<float>& distances,
+                                          float max_dist) const {
+  std::shared_lock<SharedMutex> lock(tree_mutex_);
+  knnSearchLocked(query, k, max_dist, results, distances);
+}
+
+template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::knnSearch(
+    const PointVector<PointType>& queries, int k,
+    std::vector<PointVector<PointType>>& results,
+    std::vector<std::vector<float>>& distances, float max_dist) const {
+  std::shared_lock<SharedMutex> lock(tree_mutex_);
+  results.resize(queries.size());
+  distances.resize(queries.size());
+
+  std::vector<size_t> indices(queries.size());
+  std::iota(indices.begin(), indices.end(), 0);
+  std::for_each(TREE_PAR, indices.begin(), indices.end(), [&](size_t i) {
+    knnSearchLocked(queries[i], k, max_dist, results[i], distances[i]);
+  });
+}
+
+// Caller holds tree_mutex_ (shared)
+template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::knnSearchLocked(
+    const PointType& query, int k, float max_dist,
+    PointVector<PointType>& results, std::vector<float>& distances) const {
+  results.clear();
+  distances.clear();
+  if (k <= 0 || root_ == nullptr || max_dist < 0.0f) {
+    return;
+  }
+  const float max_dist2 = std::isinf(max_dist) ? INFINITY : max_dist * max_dist;
+  std::vector<std::pair<float, const PointType*>> best;
+  best.reserve(k + 1);
+  if (root_->aabb.sqrDist(query) <= max_dist2) {
+    knnSearchInternal(root_, query, k, max_dist2, best);
+  }
+  // Copy while the lock is held: a background rebuild may free the nodes
+  results.reserve(best.size());
+  distances.reserve(best.size());
+  for (const auto& [dist2, pt] : best) {
+    results.push_back(*pt);
+    distances.push_back(std::sqrt(dist2));
+  }
+}
+
+template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::boxSearch(const AABB& box,
+                                          PointVector<PointType>& results) const {
+  results.clear();
+  std::shared_lock<SharedMutex> lock(tree_mutex_);
+  boxSearchInternal(root_, box, results);
+}
+
+template <typename PointType, typename Traits>
 int KDTree<PointType, Traits>::size() const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
   return root_ ? root_->subtree_size : 0;
@@ -439,7 +558,6 @@ void KDTree<PointType, Traits>::collect(Node* node,
                                         PointVector<PointType>& pts) const {
   if (!node)
     return;
-  pts.reserve(pts.size() + node->subtree_size);
   std::vector<Node*> stack{node};
   while (!stack.empty()) {
     Node* n = stack.back();
@@ -534,6 +652,52 @@ void KDTree<PointType, Traits>::radiusSearchInternal(
 }
 
 template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::knnSearchInternal(
+    Node* node, const PointType& query, size_t k, float max_dist2,
+    std::vector<std::pair<float, const PointType*>>& best) const {
+  float d2 = Traits::sqrDist(node->point, query);
+  if (d2 <= max_dist2 && (best.size() < k || d2 < best.back().first)) {
+    if (best.size() == k)
+      best.pop_back();
+    auto pos = std::upper_bound(
+        best.begin(), best.end(), d2,
+        [](float v, const std::pair<float, const PointType*>& e) {
+          return v < e.first;
+        });
+    best.insert(pos, {d2, &node->point});
+  }
+  int ax = node->axis;
+  float qv = Traits::coord(query, ax);
+  float nv = Traits::coord(node->point, ax);
+  Node* near = qv < nv ? node->left : node->right;
+  Node* far = qv < nv ? node->right : node->left;
+  // Search radius: the k-th best so far, or max_dist until k are found
+  if (near && near->aabb.sqrDist(query) <=
+                  (best.size() < k ? max_dist2 : best.back().first))
+    knnSearchInternal(near, query, k, max_dist2, best);
+  if (far && far->aabb.sqrDist(query) <=
+                 (best.size() < k ? max_dist2 : best.back().first))
+    knnSearchInternal(far, query, k, max_dist2, best);
+}
+
+template <typename PointType, typename Traits>
+void KDTree<PointType, Traits>::boxSearchInternal(
+    Node* node, const AABB& box, PointVector<PointType>& results) const {
+  if (!node || !box.intersects(node->aabb))
+    return;
+  if (box.contains(node->aabb)) {
+    // Whole subtree inside: no per-point test needed
+    collect(node, results);
+    return;
+  }
+  if (box.contains(node->point)) {
+    results.push_back(node->point);
+  }
+  boxSearchInternal(node->left, box, results);
+  boxSearchInternal(node->right, box, results);
+}
+
+template <typename PointType, typename Traits>
 bool KDTree<PointType, Traits>::checkAncestorNeedsRebuild(Node* node) const {
   Node* ancestor = node->parent;
   bool needs_rebuild = false;
@@ -576,6 +740,7 @@ void KDTree<PointType, Traits>::rebuildSubtrees(
 
   std::for_each(TREE_PAR, indices.begin(), indices.end(), [&](size_t i) {
     PointVector<PointType> pts;
+    pts.reserve(nodes_to_rebuild[i]->subtree_size);
     collect(nodes_to_rebuild[i], pts);
 
     new_nodes[i] =

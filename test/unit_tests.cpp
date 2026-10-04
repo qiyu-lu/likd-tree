@@ -1,6 +1,7 @@
 // unit_tests.cpp - correctness and thread-safety tests for likd-tree.
 // Every query is checked against brute force. Returns non-zero on failure.
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -71,6 +72,26 @@ bool matchesBruteForce(const Tree& tree, const Points& all, std::mt19937& rng,
   return ok;
 }
 
+// Sorted distances of the k nearest points within max_dist
+std::vector<float> bruteKnn(const Points& pts, const Pt& q, size_t k,
+                            float max_dist = INFINITY) {
+  std::vector<float> d;
+  for (const auto& p : pts) {
+    float v = dist(p, q);
+    if (v <= max_dist) d.push_back(v);
+  }
+  std::sort(d.begin(), d.end());
+  d.resize(std::min(d.size(), k));
+  return d;
+}
+
+bool sameDistances(const std::vector<float>& a, const std::vector<float>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i)
+    if (std::fabs(a[i] - b[i]) > 1e-4f) return false;
+  return true;
+}
+
 void testIncrementalQueries() {
   std::printf("[incremental queries]\n");
   std::mt19937 rng(1);
@@ -88,6 +109,84 @@ void testIncrementalQueries() {
   Tree empty;
   CHECK(!empty.nearestNeighbors(Pt{0, 0, 0}).first);
   CHECK(empty.size() == 0);
+}
+
+void testKnnSearch() {
+  std::printf("[knn search]\n");
+  std::mt19937 rng(7);
+  Tree tree;
+  Points all = blob(rng, 3000, 10.0f);
+  tree.build(all);
+  for (int i = 0; i < 40; ++i) {
+    Points b = blob(rng, 500);
+    tree.addPoints(b, true);
+    all.insert(all.end(), b.begin(), b.end());
+  }
+  std::uniform_real_distribution<float> u(-60.0f, 60.0f);
+  Points queries;
+  for (int i = 0; i < 300; ++i) {
+    Pt q{u(rng), u(rng), u(rng)};
+    queries.push_back(q);
+    for (int k : {1, 5, 17}) {
+      for (float max_dist : {INFINITY, 4.0f}) {
+        Points res;
+        std::vector<float> d;
+        tree.knnSearch(q, k, res, d, max_dist);
+        bool ok = sameDistances(d, bruteKnn(all, q, k, max_dist)) &&
+                  res.size() == d.size();
+        for (size_t j = 0; ok && j < res.size(); ++j)
+          ok = std::fabs(dist(res[j], q) - d[j]) < 1e-4f;
+        CHECK(ok);
+      }
+    }
+  }
+  // Batch API agrees with the single-query API
+  std::vector<Points> batch_res;
+  std::vector<std::vector<float>> batch_d;
+  tree.knnSearch(queries, 5, batch_res, batch_d);
+  CHECK(batch_res.size() == queries.size() && batch_d.size() == queries.size());
+  for (size_t i = 0; i < queries.size(); ++i)
+    CHECK(sameDistances(batch_d[i], bruteKnn(all, queries[i], 5)));
+
+  Points res;
+  std::vector<float> d;
+  tree.knnSearch(queries[0], 0, res, d);
+  CHECK(res.empty() && d.empty());
+  Tree empty;
+  empty.knnSearch(queries[0], 5, res, d);
+  CHECK(res.empty() && d.empty());
+}
+
+void testBoxSearch() {
+  std::printf("[box search]\n");
+  std::mt19937 rng(8);
+  Tree tree;
+  Points all = blob(rng, 3000, 10.0f);
+  tree.build(all);
+  for (int i = 0; i < 40; ++i) {
+    Points b = blob(rng, 500);
+    tree.addPoints(b, true);
+    all.insert(all.end(), b.begin(), b.end());
+  }
+  std::uniform_real_distribution<float> u(-60.0f, 60.0f);
+  std::uniform_real_distribution<float> half(0.5f, 30.0f);
+  for (int i = 0; i < 300; ++i) {
+    float cx = u(rng), cy = u(rng), cz = u(rng), h = half(rng);
+    Tree::AABB box({cx - h, cy - h, cz - h}, {cx + h, cy + h, cz + h});
+    Points res;
+    tree.boxSearch(box, res);
+    size_t expected = std::count_if(all.begin(), all.end(),
+                                    [&](const Pt& p) { return box.contains(p); });
+    bool ok = res.size() == expected;
+    for (const auto& p : res) ok = ok && box.contains(p);
+    CHECK(ok);
+  }
+  // Box containing everything, and an empty one
+  Points res;
+  tree.boxSearch(Tree::AABB({-1e9f, -1e9f, -1e9f}, {1e9f, 1e9f, 1e9f}), res);
+  CHECK(res.size() == all.size());
+  tree.boxSearch(Tree::AABB({1e8f, 1e8f, 1e8f}, {1e9f, 1e9f, 1e9f}), res);
+  CHECK(res.empty());
 }
 
 // Batches that arrive while the worker drains the pending buffer used to be
@@ -209,6 +308,8 @@ void testReadersDuringWritesAndBuild() {
 int main() {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   testIncrementalQueries();
+  testKnnSearch();
+  testBoxSearch();
   testNoPointsLostDuringRebuild();
   testWaitForRebuild();
   testNearestIsCopy();
