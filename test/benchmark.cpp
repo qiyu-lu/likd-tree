@@ -5,6 +5,8 @@
 //   ./benchmark            100K uniform random points, 1000-point frames
 //   ./benchmark map.pcd    stream a real map in file order, 2000-point frames,
 //                          plus a local-map test with box deletion
+// Options for a map: --max-points N keeps only its first N points, and
+// --frame N sets the points per frame.
 //
 // Memory is the heap growth (glibc mallinfo, all arenas) while one tree is
 // built or fed alone, divided by the points it holds. RSS growth is printed
@@ -471,19 +473,35 @@ void nanoflannReference(const PointVector<PointType>& pts,
 }  // namespace
 
 int main(int argc, char** argv) {
-  PointVector<PointType> pts;
-  size_t frame;
-  if (argc > 1) {
-    pcl::PointCloud<PointType> cloud;
-    if (pcl::io::loadPCDFile<PointType>(argv[1], cloud) < 0) {
-      std::cerr << "Failed to read " << argv[1] << std::endl;
+  const char* map = nullptr;
+  size_t max_points = 0, frame = 0;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if ((arg == "--max-points" || arg == "--frame") && i + 1 < argc) {
+      (arg == "--frame" ? frame : max_points) = std::stoul(argv[++i]);
+    } else if (arg[0] != '-' && !map) {
+      map = argv[i];
+    } else {
+      std::cerr << "Usage: " << argv[0]
+                << " [map.pcd [--max-points N] [--frame N]]" << std::endl;
       return 1;
     }
-    for (const auto& p : cloud.points)
+  }
+  PointVector<PointType> pts;
+  if (map) {
+    pcl::PointCloud<PointType> cloud;
+    if (pcl::io::loadPCDFile<PointType>(map, cloud) < 0) {
+      std::cerr << "Failed to read " << map << std::endl;
+      return 1;
+    }
+    for (const auto& p : cloud.points) {
+      if (max_points && pts.size() == max_points) break;
       if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
         pts.push_back(p);
-    frame = 2000;
-    std::cout << "Map " << argv[1] << ": " << pts.size() << " points\n";
+    }
+    if (!frame) frame = 2000;
+    std::cout << "Map " << map << ": " << pts.size() << " points, " << frame
+              << "-point frames\n";
   } else {
     std::mt19937 rng(12345);
     std::uniform_real_distribution<float> dist(-100.0f, 100.0f);
@@ -493,7 +511,7 @@ int main(int argc, char** argv) {
       p.y = dist(rng);
       p.z = dist(rng);
     }
-    frame = 1000;
+    if (!frame) frame = 1000;
     std::cout << "100K uniform random points in [-100, 100]^3\n";
   }
   // Start TBB's worker threads before any memory is measured
@@ -506,7 +524,7 @@ int main(int argc, char** argv) {
   {
     const long n = static_cast<long>(pts.size());
     // Radius and box half size giving tens to a hundred points per query
-    const float radius = argc > 1 ? 1.0f : 10.0f;
+    const float radius = map ? 1.0f : 10.0f;
     const float box_half = radius;
     LikdTree likd;
     releaseFreeMemory();
@@ -605,7 +623,7 @@ int main(int argc, char** argv) {
   runStream(pts, frame, 0.0f);
   streamMemory(pts, frame, 0.0f);
 
-  if (argc > 1) {
+  if (map) {
     std::cout << "\n=== Part 3: Local map, 100 m cube, box delete every 10 "
                  "frames ===" << std::endl;
     runStream(pts, frame, 50.0f);
