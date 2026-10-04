@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -15,6 +16,15 @@
 // Compiles KDTree::validate()
 #define LIKD_TREE_TESTING
 #include "../src/likd_tree.hpp"
+
+// Sanitizers slow the tests down several times: skip the timing checks
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define LIKD_TEST_SANITIZED
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define LIKD_TEST_SANITIZED
+#endif
+#endif
 
 namespace {
 
@@ -102,8 +112,9 @@ std::vector<float> bruteKnn(const Points& pts, const Pt& q, size_t k,
     float v = dist(p, q);
     if (v <= max_dist) d.push_back(v);
   }
-  std::sort(d.begin(), d.end());
-  d.resize(std::min(d.size(), k));
+  k = std::min(d.size(), k);
+  std::partial_sort(d.begin(), d.begin() + k, d.end());
+  d.resize(k);
   return d;
 }
 
@@ -499,6 +510,71 @@ void testReuseDeletedSlot() {
   CHECK(tree.validate());
 }
 
+// One long write is applied in chunks: its first chunk unbalances the tree,
+// and the rest of it is queued behind the rebuild, ahead of the calls that
+// follow. The worker then stops replaying whenever a batch unbalances a
+// subtree. Through all of that, deletes must still come after the inserts
+// they refer to, and inserts after the deletes before them.
+template <typename Tree>
+void testWriteOrderAcrossChunks() {
+  std::printf("[write order across chunks]\n");
+  std::mt19937 rng(20);
+  const size_t n = 100000;
+  Points pts(n);
+  for (size_t i = 0; i < n; ++i) pts[i] = {i * 0.01f, 0, 0};
+  auto range = [&](size_t a, size_t b) {
+    return Points(pts.begin() + a, pts.begin() + b);
+  };
+  typename Tree::AABB box({700, -1, -1}, {800, 1, 1});
+  Tree tree;
+  tree.addPoints(pts);
+  // Let the worker take the queued rest of that call and start replaying it,
+  // so that the calls below are queued while it still holds part of it back.
+  // In a different order, a delete would miss its point or an insert would
+  // be deleted.
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  tree.deletePoints(range(0, n / 2));
+  tree.addPoints(range(0, n / 4));
+  tree.deletePoints(range(0, n / 8));
+  tree.deleteBox(box);
+  tree.addPoints(range(75000, 76000));
+  Points model = range(n / 8, n / 4);
+  for (size_t i = n / 2; i < n; ++i)
+    if (!box.contains(pts[i])) model.push_back(pts[i]);
+  Points refill = range(75000, 76000);
+  model.insert(model.end(), refill.begin(), refill.end());
+  auto matches = [&] {
+    if (tree.size() != static_cast<int>(model.size())) return false;
+    std::uniform_real_distribution<float> u(-10.0f, n * 0.01f + 10.0f);
+    for (int i = 0; i < 50; ++i) {
+      Pt q{u(rng), 0.2f, -0.1f};
+      Points res;
+      std::vector<float> d;
+      tree.knnSearch(q, 8, res, d);
+      if (!sameDistances(d, bruteKnn(model, q, 8))) return false;
+    }
+    return true;
+  };
+  tree.waitForRebuild();
+  CHECK(tree.validate());
+  CHECK(matches());
+  // From an idle tree: the first chunk of this delete leaves its subtrees
+  // mostly deleted, so the rest of it and the insert after it are queued
+  tree.deletePoints(range(n / 2, n / 2 + 20000));
+  tree.addPoints(range(n / 2, n / 2 + 5000));
+  model.erase(std::remove_if(model.begin(), model.end(),
+                             [&](const Pt& p) {
+                               return p.x >= pts[n / 2].x &&
+                                      p.x <= pts[n / 2 + 19999].x;
+                             }),
+              model.end());
+  Points back = range(n / 2, n / 2 + 5000);
+  model.insert(model.end(), back.begin(), back.end());
+  tree.waitForRebuild();
+  CHECK(tree.validate());
+  CHECK(matches());
+}
+
 // Random writes, each followed by waiting for the rebuild and a check of the
 // whole tree's structure.
 template <typename Tree>
@@ -574,6 +650,53 @@ void testRebuildStats() {
   CHECK((s.max_queued_ops == 0) == (s.max_queued_ms == 0));
 }
 #endif
+
+// Points sorted along x, or all identical, written in one call or in
+// 2000-point frames without waiting. Each of them lands in the same leaf as
+// the one before, so without rebalancing between chunks of a write and
+// between batches of a replay, the tree grew into a chain and the time grew
+// with the square of the count: about a minute for 400k points.
+template <typename Tree>
+void testOrderedWrites() {
+  std::printf("[ordered writes]\n");
+  std::mt19937 rng(19);
+  const size_t n = 400000, frame = 2000;
+  for (bool identical : {false, true}) {
+    Points pts(n);
+    for (size_t i = 0; i < n; ++i)
+      pts[i] = identical ? Pt{1.5f, -2.0f, 3.0f} : Pt{i * 0.01f, 0, 0};
+    for (bool frames : {false, true}) {
+      Tree tree;
+      auto start = std::chrono::steady_clock::now();
+      if (frames) {
+        for (size_t s = 0; s < n; s += frame)
+          tree.addPoints(Points(pts.begin() + s, pts.begin() + std::min(n, s + frame)));
+      } else {
+        tree.addPoints(pts);
+      }
+      tree.waitForRebuild();
+      double ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - start)
+                      .count();
+      std::printf("  %s points, %s: %.0f ms\n", identical ? "identical" : "sorted",
+                  frames ? "2000-point frames" : "one call", ms);
+#ifndef LIKD_TEST_SANITIZED
+      // Well under a second; the margin covers a busy machine
+      CHECK(ms < 10000);
+#endif
+      CHECK(tree.validate());
+      CHECK(tree.size() == static_cast<int>(n));
+      std::uniform_real_distribution<float> u(-0.05f * n * 0.01f, 1.05f * n * 0.01f);
+      for (int i = 0; i < 10; ++i) {
+        Pt q = identical ? Pt{1.5f + i * 0.1f, -2.0f, 3.0f} : Pt{u(rng), 0.3f, -0.2f};
+        Points res;
+        std::vector<float> d;
+        tree.knnSearch(q, 8, res, d);
+        CHECK(sameDistances(d, bruteKnn(pts, q, 8)));
+      }
+    }
+  }
+}
 
 template <typename Tree>
 void testWaitForRebuild() {
@@ -700,6 +823,7 @@ void bruteForceTests(const char* label) {
   testInsertAfterDeletingSubtrees<Tree>();
   testValidatedRandomWrites<Tree>();
   testReuseDeletedSlot<Tree, N>();
+  testWriteOrderAcrossChunks<Tree>();
 }
 
 template <typename Tree>
@@ -713,6 +837,7 @@ void concurrencyTests(const char* label) {
   testNearestIsCopy<Tree>();
   testConcurrentWriters<Tree>();
   testReadersDuringWritesAndBuild<Tree>();
+  testOrderedWrites<Tree>();
 }
 
 }  // namespace

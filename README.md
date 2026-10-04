@@ -210,6 +210,11 @@ size_t bytes = tree.memoryUsage();
   queued and applied in order right after, so a query may briefly not see
   them. Call `waitForRebuild()` (or pass `wait_for_rebuild = true`) when they
   must be visible.
+- A write call is applied in chunks of 2000 points (or boxes). Once a chunk
+  leaves a subtree unbalanced, its rebuild starts and the rest of the call is
+  queued behind it, so a call larger than that may return before all of it is
+  visible. This keeps long runs of sorted or identical points from turning the
+  tree into a chain.
 - Known limitation: the queue has no bound. Writes issued back to back, with
   no pause between them, make it grow, and each write then takes longer to
   become visible. Calling `waitForRebuild()` from time to time keeps both in

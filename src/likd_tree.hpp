@@ -16,7 +16,9 @@ Distributed under MIT license. See LICENSE for more information.
 // gains no parallelism.
 //
 // While a background rebuild runs, writes are queued and applied in order once
-// it finishes, so queries may briefly not see the latest writes.
+// it finishes, so queries may briefly not see the latest writes. A write call
+// is applied in chunks of WRITE_CHUNK_SIZE operations: once a chunk unbalances
+// a subtree, the rebuild starts and the rest of the call is queued behind it.
 
 #pragma once
 
@@ -41,7 +43,10 @@ Distributed under MIT license. See LICENSE for more information.
 constexpr double KDTREE_ALPHA = 0.75;
 // Rebuild a subtree once more than this fraction of its points is deleted
 constexpr double KDTREE_DELETE_ALPHA = 0.5;
+// Queued writes are replayed in batches of this many, each under one lock
 constexpr int INSERTION_BATCH_SIZE = 100;
+// A write call checks for unbalanced subtrees after every this many operations
+constexpr size_t WRITE_CHUNK_SIZE = 2000;
 // Subtrees larger than this are built with parallel tasks (TBB only)
 constexpr size_t MIN_PARALLEL_BUILD_SIZE = 20000;
 #ifdef LIKD_TREE_USE_TBB
@@ -154,9 +159,12 @@ class KDTree {
   struct RebuildStats {
     size_t rounds = 0;          // rebuild rounds run by the worker
     double max_round_ms = 0;    // longest round: collect, build, swap, free
-    size_t max_queued_ops = 0;  // most writes waiting in the queue at once
-    // Longest time from queueing a write until the replay that applies it
-    // has finished: how long a write may stay invisible to queries.
+    // Most writes waiting at once, sampled whenever writes are queued. Writes
+    // the worker set aside to rebuild before replaying them count as waiting.
+    size_t max_queued_ops = 0;
+    // Longest time from queueing a write until the worker has replayed it and
+    // every write it took from the queue together with it, rebuilds in
+    // between included: how long a write may stay invisible to queries.
     double max_queued_ms = 0;
   };
   RebuildStats rebuildStats() const;
@@ -249,8 +257,8 @@ class KDTree {
   static void forEachValid(const Leaf* leaf, Fn&& fn);
   static int longestAxis(const AABB& box);
 
-  template <typename ApplyFn, typename EnqueueFn>
-  void write(ApplyFn&& apply_now, EnqueueFn&& enqueue, bool wait_for_rebuild);
+  template <typename ApplyFn, typename OpFn>
+  void write(size_t count, ApplyFn&& apply, OpFn&& to_op, bool wait_for_rebuild);
   void applyOp(const Op& op, std::vector<Node*>* candidates);
   Leaf* newLeaf();
   Inner* newInner(float split, int axis);
@@ -313,6 +321,9 @@ class KDTree {
   RebuildStats stats_;
   // When the oldest write in pending_ops_ was queued
   std::chrono::steady_clock::time_point queued_since_;
+  // Writes the worker took from pending_ops_ and set aside while it rebuilds
+  // a subtree, to replay right after
+  size_t held_ops_ = 0;
 #endif
 };
 
@@ -420,54 +431,69 @@ void KDTree<PointType, Traits, Options>::build(const PointVector<PointType>& pts
   destroy(old_root);
 }
 
-// Runs apply_now(candidates) on the tree, or enqueue(pending_ops_) while a
-// rebuild is running, then hands any unbalanced subtrees to the worker.
+// Performs the count operations of one write call in order: apply(i,
+// candidates) applies operation i to the tree, to_op(i) returns it for the
+// queue. While a rebuild runs, all of them are queued. Otherwise they are
+// applied in chunks of WRITE_CHUNK_SIZE, and once a chunk unbalances a
+// subtree, the subtree goes to the worker and the rest of the call is queued
+// behind it. A long run of writes into one place, such as points sorted along
+// an axis, is thus rebalanced as it goes instead of growing into a chain that
+// every later write has to walk.
 template <typename PointType, typename Traits, typename Options>
-template <typename ApplyFn, typename EnqueueFn>
-void KDTree<PointType, Traits, Options>::write(ApplyFn&& apply_now, EnqueueFn&& enqueue,
-                                      bool wait_for_rebuild) {
+template <typename ApplyFn, typename OpFn>
+void KDTree<PointType, Traits, Options>::write(size_t count, ApplyFn&& apply,
+                                      OpFn&& to_op, bool wait_for_rebuild) {
   std::lock_guard<std::mutex> write_lock(write_mutex_);
-  bool buffered = false;
+  size_t done = 0;
+  // Queues the operations not applied yet. Caller holds pending_mutex_.
+  auto queue_rest = [&] {
+#ifdef LIKD_TREE_STATS
+    if (pending_ops_.empty())
+      queued_since_ = std::chrono::steady_clock::now();
+#endif
+    for (; done < count; ++done)
+      pending_ops_.push_back(to_op(done));
+#ifdef LIKD_TREE_STATS
+    stats_.max_queued_ops =
+        std::max(stats_.max_queued_ops, pending_ops_.size() + held_ops_);
+#endif
+  };
   {
     // rebuilding_ is checked under pending_mutex_, the same lock the worker
     // holds when it leaves the rebuilding state, so queued writes can never
     // be left behind in pending_ops_.
     std::lock_guard<std::mutex> lock(pending_mutex_);
-    if (rebuilding_.load()) {
-#ifdef LIKD_TREE_STATS
-      if (pending_ops_.empty())
-        queued_since_ = std::chrono::steady_clock::now();
-#endif
-      enqueue(pending_ops_);
-#ifdef LIKD_TREE_STATS
-      stats_.max_queued_ops = std::max(stats_.max_queued_ops, pending_ops_.size());
-#endif
-      buffered = true;
-    }
+    if (rebuilding_.load())
+      queue_rest();
   }
 
-  if (!buffered) {
+  while (done < count) {
     std::vector<Node*> nodes_to_rebuild;
     // Write + filtering phase - protected by exclusive lock
     {
       std::unique_lock<SharedMutex> lock(tree_mutex_);
       std::vector<Node*> candidates;
-      apply_now(&candidates);
+      size_t end = std::min(count, done + WRITE_CHUNK_SIZE);
+      for (; done < end; ++done)
+        apply(done, &candidates);
       nodes_to_rebuild = topmostCandidates(candidates);
     }
+    if (nodes_to_rebuild.empty())
+      continue;
 
-    // Hand the unbalanced subtrees to the worker. Writers are serialized and
-    // only writers set rebuilding_, so it is still false here.
-    if (!nodes_to_rebuild.empty()) {
-      {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        rebuilding_ = true;
-        rebuild_job_ = std::move(nodes_to_rebuild);
-        if (!worker_.joinable())
-          worker_ = std::thread(&KDTree::workerLoop, this);
-      }
-      job_cv_.notify_one();
+    // Hand the unbalanced subtrees to the worker and queue the rest of the
+    // call behind them. Writers are serialized and only writers set
+    // rebuilding_, so it is still false here and pending_ops_ is empty.
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      rebuilding_ = true;
+      rebuild_job_ = std::move(nodes_to_rebuild);
+      if (done < count)
+        queue_rest();
+      if (!worker_.joinable())
+        worker_ = std::thread(&KDTree::workerLoop, this);
     }
+    job_cv_.notify_one();
   }
   // Optionally wait for rebuild to complete before returning
   if (wait_for_rebuild) {
@@ -479,16 +505,11 @@ template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::addPoints(const PointVector<PointType>& pts,
                                           bool wait_for_rebuild) {
   write(
-      [&](std::vector<Node*>* candidates) {
-        for (const auto& p : pts) {
-          root_ = insertInternal(root_, p, candidates);
-        }
+      pts.size(),
+      [&](size_t i, std::vector<Node*>* candidates) {
+        root_ = insertInternal(root_, pts[i], candidates);
       },
-      [&](OpLog& ops) {
-        for (const auto& p : pts) {
-          ops.push_back({OpType::kInsert, p, AABB()});
-        }
-      },
+      [&](size_t i) { return Op{OpType::kInsert, pts[i], AABB()}; },
       wait_for_rebuild);
 }
 
@@ -496,16 +517,11 @@ template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::deletePoints(const PointVector<PointType>& pts,
                                              bool wait_for_rebuild) {
   write(
-      [&](std::vector<Node*>* candidates) {
-        for (const auto& p : pts) {
-          deletePointInternal(root_, p, candidates);
-        }
+      pts.size(),
+      [&](size_t i, std::vector<Node*>* candidates) {
+        deletePointInternal(root_, pts[i], candidates);
       },
-      [&](OpLog& ops) {
-        for (const auto& p : pts) {
-          ops.push_back({OpType::kDeletePoint, p, AABB()});
-        }
-      },
+      [&](size_t i) { return Op{OpType::kDeletePoint, pts[i], AABB()}; },
       wait_for_rebuild);
 }
 
@@ -513,16 +529,11 @@ template <typename PointType, typename Traits, typename Options>
 void KDTree<PointType, Traits, Options>::deleteBoxes(const std::vector<AABB>& boxes,
                                             bool wait_for_rebuild) {
   write(
-      [&](std::vector<Node*>* candidates) {
-        for (const auto& box : boxes) {
-          deleteBoxInternal(root_, box, candidates);
-        }
+      boxes.size(),
+      [&](size_t i, std::vector<Node*>* candidates) {
+        deleteBoxInternal(root_, boxes[i], candidates);
       },
-      [&](OpLog& ops) {
-        for (const auto& box : boxes) {
-          ops.push_back({OpType::kDeleteBox, PointType(), box});
-        }
-      },
+      [&](size_t i) { return Op{OpType::kDeleteBox, PointType(), boxes[i]}; },
       wait_for_rebuild);
 }
 
@@ -1372,6 +1383,13 @@ void KDTree<PointType, Traits, Options>::workerLoop() {
     }
     std::vector<Node*> job = std::move(rebuild_job_);
     rebuild_job_.clear();
+    // Writes taken from pending_ops_. Those from `replayed` on are not
+    // applied yet; they come before everything queued since.
+    OpLog ops;
+    size_t replayed = 0;
+#ifdef LIKD_TREE_STATS
+    std::chrono::steady_clock::time_point queued_since;
+#endif
     while (true) {
       lock.unlock();
 #ifdef LIKD_TREE_STATS
@@ -1391,36 +1409,48 @@ void KDTree<PointType, Traits, Options>::workerLoop() {
         stats_.max_round_ms = std::max(stats_.max_round_ms, round.count());
       }
 #endif
-      // Leave the rebuilding state only after seeing an empty queue while
-      // holding pending_mutex_: writers check rebuilding_ under this lock.
-      if (pending_ops_.empty()) {
-        break;
-      }
-      OpLog ops = std::move(pending_ops_);
-      pending_ops_.clear();
+      if (replayed == ops.size()) {
+        // Leave the rebuilding state only after seeing an empty queue while
+        // holding pending_mutex_: writers check rebuilding_ under this lock.
+        if (pending_ops_.empty()) {
+          break;
+        }
+        ops = std::move(pending_ops_);
+        pending_ops_.clear();
+        replayed = 0;
 #ifdef LIKD_TREE_STATS
-      auto queued_since = queued_since_;
+        queued_since = queued_since_;
+#endif
+      }
+#ifdef LIKD_TREE_STATS
+      held_ops_ = 0;
 #endif
       lock.unlock();
 
       // Replay in order, in small batches to allow queries to interleave.
-      // Subtrees these writes unbalance are rebuilt in the next round.
+      // Stop after a batch that unbalances a subtree: the next round rebuilds
+      // it before the rest is replayed, so that a long run of writes into one
+      // place cannot grow a chain that every later write has to walk.
       std::vector<Node*> candidates;
-      for (size_t i = 0; i < ops.size(); i += INSERTION_BATCH_SIZE) {
+      job.clear();
+      while (replayed < ops.size() && candidates.empty()) {
         std::unique_lock<SharedMutex> tree_lock(tree_mutex_);
-        size_t end = std::min(i + INSERTION_BATCH_SIZE, ops.size());
-        for (size_t j = i; j < end; ++j) {
-          applyOp(ops[j], &candidates);
+        size_t end = std::min(replayed + INSERTION_BATCH_SIZE, ops.size());
+        for (; replayed < end; ++replayed) {
+          applyOp(ops[replayed], &candidates);
         }
-        if (end == ops.size()) {
+        if (!candidates.empty()) {
           job = topmostCandidates(candidates);
         }
       }
       lock.lock();
 #ifdef LIKD_TREE_STATS
-      std::chrono::duration<double, std::milli> queued =
-          std::chrono::steady_clock::now() - queued_since;
-      stats_.max_queued_ms = std::max(stats_.max_queued_ms, queued.count());
+      held_ops_ = ops.size() - replayed;
+      if (replayed == ops.size()) {
+        std::chrono::duration<double, std::milli> queued =
+            std::chrono::steady_clock::now() - queued_since;
+        stats_.max_queued_ms = std::max(stats_.max_queued_ms, queued.count());
+      }
 #endif
     }
     rebuilding_ = false;
