@@ -295,6 +295,7 @@ void testDeleteAll() {
   tree.deleteBox(Tree::AABB({-1e9f, -1e9f, -1e9f}, {1e9f, 1e9f, 1e9f}), true);
   CHECK(tree.size() == 0);
   CHECK(tree.nodeCount() == 0);
+  CHECK(tree.memoryUsage() == 0);
   CHECK(!tree.nearestNeighbors(Pt{0, 0, 0}).first);
   Points res, queries(3, Pt{0, 0, 0});
   std::vector<float> d;
@@ -306,6 +307,25 @@ void testDeleteAll() {
   tree.addPoints(again, true);
   CHECK(tree.size() == 1000);
   CHECK(matchesBruteForce(tree, again, rng, 50));
+}
+
+// Deleting most points and letting the rebuild reclaim them shrinks the memory.
+void testMemoryUsage() {
+  std::printf("[memory usage]\n");
+  std::mt19937 rng(12);
+  Tree tree;
+  CHECK(tree.memoryUsage() == 0);
+  Points pts = blob(rng, 20000, 10.0f);
+  tree.build(pts);
+  size_t full = tree.memoryUsage();
+  CHECK(full >= pts.size() * sizeof(Pt));
+  std::vector<float> xs;
+  for (const auto& p : pts) xs.push_back(p.x);
+  std::nth_element(xs.begin(), xs.begin() + xs.size() * 9 / 10, xs.end());
+  float x90 = xs[xs.size() * 9 / 10];
+  tree.deleteBox(Tree::AABB({-1e9f, -1e9f, -1e9f}, {x90, 1e9f, 1e9f}), true);
+  CHECK(tree.size() < static_cast<int>(pts.size()) / 5);
+  CHECK(tree.memoryUsage() <= full / 4);
 }
 
 // Batches that arrive while the worker drains the pending buffer used to be
@@ -440,6 +460,7 @@ int main() {
   testDeleteDifferential();
   testDeleteTies();
   testDeleteAll();
+  testMemoryUsage();
   testNoPointsLostDuringRebuild();
   testWaitForRebuild();
   testNearestIsCopy();

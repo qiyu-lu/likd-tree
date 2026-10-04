@@ -137,6 +137,9 @@ class KDTree {
   // Nodes held in memory, including deleted points not yet reclaimed by a
   // rebuild.
   int nodeCount() const;
+  // Bytes held by the tree's nodes, deleted ones included, excluding
+  // allocator overhead.
+  size_t memoryUsage() const;
   // Blocks until the background rebuild, including the writes queued while
   // it ran, has finished.
   void waitForRebuild() const;
@@ -600,6 +603,12 @@ template <typename PointType, typename Traits>
 int KDTree<PointType, Traits>::nodeCount() const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
   return root_ ? root_->subtree_size : 0;
+}
+
+template <typename PointType, typename Traits>
+size_t KDTree<PointType, Traits>::memoryUsage() const {
+  std::shared_lock<SharedMutex> lock(tree_mutex_);
+  return root_ ? static_cast<size_t>(root_->subtree_size) * sizeof(Node) : 0;
 }
 
 template <typename PointType, typename Traits>
