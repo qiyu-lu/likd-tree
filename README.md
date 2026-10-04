@@ -8,6 +8,11 @@
 
 `likd-tree` is a lightweight incremental KD-tree designed for dynamic point insertion with automatic rebalancing.
 
+> This repository continues [scomup/likd-tree](https://github.com/scomup/likd-tree)
+> by Liu Yang, which has had no updates since January 2026. It adds thread-safety
+> fixes, k-NN and box search, point and box deletion, and a like-for-like
+> benchmark against ikd-tree. See [License & Acknowledgements](#license--acknowledgements).
+
 ## C++ Version
 Inspired by [ikd-tree](https://github.com/hku-mars/ikd-Tree), `likd-tree` is completely reimplemented using modern C++17 and features a more intelligent and principled rebalance strategy, which significantly improves efficiency while keeping the structure lightweight and easy to maintain.
 
@@ -342,3 +347,13 @@ cmake --build build
 - [x] k-nearest neighbors (k-NN) query
 - [x] box queries
 - [ ] Python bindings for k-NN, radius/box search and deletion
+
+## License & Acknowledgements
+
+MIT, see [LICENSE](LICENSE). The original likd-tree is © 2026 Liu Yang
+([scomup/likd-tree](https://github.com/scomup/likd-tree)); changes made in this
+repository are © 2026 qiyu-lu.
+
+The design is inspired by [ikd-Tree](https://github.com/hku-mars/ikd-Tree)
+(GPL-2.0). The library contains no ikd-Tree code; only the benchmark builds
+against it, pulled in as a git submodule.
