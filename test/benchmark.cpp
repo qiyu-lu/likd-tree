@@ -16,6 +16,10 @@
 //   -DLIKD_BENCH_LEAF_SIZE=N   likd-tree leaf size (default: the library's)
 //   -DLIKD_BENCH_XYZINORMAL    pcl::PointXYZINormal (48 bytes) instead of
 //                              pcl::PointXYZ
+//   -DLIKD_BENCH_STAMPS        likd-tree keeps stamps (TRACK_STAMPS); frames
+//                              are stamped with their number. Adds Part 4
+//                              (Part 2 with touch) and, for a map, Part 5
+//                              (expiry).
 
 // Enable TBB parallel execution and rebuild statistics (define before
 // including likd_tree.hpp)
@@ -59,9 +63,14 @@ using PointType = pcl::PointXYZINormal;
 #else
 using PointType = pcl::PointXYZ;
 #endif
-#ifdef LIKD_BENCH_LEAF_SIZE
+#if defined(LIKD_BENCH_LEAF_SIZE) || defined(LIKD_BENCH_STAMPS)
 struct BenchOptions : DefaultOptions {
+#ifdef LIKD_BENCH_LEAF_SIZE
   static constexpr int LEAF_SIZE = LIKD_BENCH_LEAF_SIZE;
+#endif
+#ifdef LIKD_BENCH_STAMPS
+  static constexpr bool TRACK_STAMPS = true;
+#endif
 };
 using LikdTree = KDTree<PointType, PointTraits<PointType>, BenchOptions>;
 #else
@@ -118,6 +127,25 @@ double perPoint(long before, long after, long points) {
   return double(after - before) / points;
 }
 
+// With stamps, the first frame (or the whole map) is stamped 0 and frame f
+// of a stream is stamped f
+void likdBuild(LikdTree& tree, const PointVector<PointType>& pts) {
+#ifdef LIKD_BENCH_STAMPS
+  tree.build(pts, LikdTree::Stamp{0});
+#else
+  tree.build(pts);
+#endif
+}
+
+void likdAdd(LikdTree& tree, const PointVector<PointType>& pts,
+             [[maybe_unused]] uint32_t frame) {
+#ifdef LIKD_BENCH_STAMPS
+  tree.addPoints(pts, LikdTree::Stamp{frame});
+#else
+  tree.addPoints(pts);
+#endif
+}
+
 std::vector<float> likdNN(const LikdTree& tree, const PointVector<PointType>& qs) {
   std::vector<float> d(qs.size());
   for (size_t i = 0; i < qs.size(); ++i) d[i] = tree.nearestNeighbors(qs[i]).second;
@@ -140,6 +168,43 @@ std::vector<float> likdKnn(const LikdTree& tree, const PointVector<PointType>& q
     for (size_t i = 0; i < qs.size(); ++i) one(i);
   return kth;
 }
+
+#ifdef LIKD_BENCH_STAMPS
+// likdKnn, sequential, also appending every neighbor found to `found`
+std::vector<float> likdKnnFound(const LikdTree& tree, const PointVector<PointType>& qs,
+                                int k, PointVector<PointType>& found) {
+  std::vector<float> kth(qs.size(), INFINITY);
+  PointVector<PointType> res;
+  std::vector<float> d;
+  for (size_t i = 0; i < qs.size(); ++i) {
+    tree.knnSearch(qs[i], k, res, d);
+    if (!d.empty()) kth[i] = d.back();
+    found.insert(found.end(), res.begin(), res.end());
+  }
+  return kth;
+}
+
+double sumOf(const std::vector<double>& v) {
+  return std::accumulate(v.begin(), v.end(), 0.0);
+}
+
+double median(std::vector<double> v) {
+  std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+  return v[v.size() / 2];
+}
+
+// Distinct points in pts (reorders it)
+size_t countDistinct(PointVector<PointType>& pts) {
+  std::sort(pts.begin(), pts.end(), [](const PointType& a, const PointType& b) {
+    return std::tie(a.x, a.y, a.z) < std::tie(b.x, b.y, b.z);
+  });
+  return std::unique(pts.begin(), pts.end(),
+                     [](const PointType& a, const PointType& b) {
+                       return a.x == b.x && a.y == b.y && a.z == b.z;
+                     }) -
+         pts.begin();
+}
+#endif
 
 std::vector<float> ikdKnn(IkdTree& tree, const PointVector<PointType>& qs, int k,
                           bool parallel) {
@@ -241,17 +306,22 @@ std::vector<BoxPointType> toIkdBoxes(const std::vector<LikdTree::AABB>& boxes) {
 
 // Feed `pts` frame by frame: query the frame against the map, then insert it.
 // With local_map_half > 0, every 10 frames delete everything outside a cube
-// around the frame centroid.
+// around the frame centroid. With touch (stamps only), likd-tree also
+// touches, after each frame's queries, every neighbor its sequential 5-NN
+// queries returned, and only the touch rows and rebuild statistics are
+// printed.
 void runStream(const PointVector<PointType>& pts, size_t frame,
-               float local_map_half) {
+               float local_map_half, [[maybe_unused]] bool touch = false) {
   LikdTree likd;
   IkdTree* ikd = new IkdTree();  // ~48 MB operation queue: keep off the stack
   Totals L, I;
   long stale = 0, total = 0;
+  [[maybe_unused]] std::vector<double> touch_ms;
+  [[maybe_unused]] size_t neighbors = 0, distinct = 0;
 
   PointVector<PointType> first(pts.begin(), pts.begin() + frame);
   auto t0 = Clock::now();
-  likd.build(first);
+  likdBuild(likd, first);
   auto t1 = Clock::now();
   ikd->Build(first);
   auto t2 = Clock::now();
@@ -268,7 +338,13 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
     auto q1 = Clock::now();
     ikdKnn(*ikd, batch, 1, false);
     auto q2 = Clock::now();
+#ifdef LIKD_BENCH_STAMPS
+    PointVector<PointType> found;
+    std::vector<float> lk = touch ? likdKnnFound(likd, batch, K, found)
+                                  : likdKnn(likd, batch, K, false);
+#else
     std::vector<float> lk = likdKnn(likd, batch, K, false);
+#endif
     auto q3 = Clock::now();
     std::vector<float> ik = ikdKnn(*ikd, batch, K, false);
     auto q4 = Clock::now();
@@ -286,10 +362,19 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
     // means likd-tree answered from a map without its queued writes
     for (size_t i = 0; i < batch.size(); ++i, ++total)
       stale += std::fabs(lk[i] - ik[i]) > 1e-3f;
+#ifdef LIKD_BENCH_STAMPS
+    if (touch) {
+      auto t0 = Clock::now();
+      likd.touchPoints(found, LikdTree::Stamp{static_cast<uint32_t>(frames + 1)});
+      touch_ms.push_back(elapsedMs(t0, Clock::now()));
+      neighbors += found.size();
+      distinct += countDistinct(found);
+    }
+#endif
 
     // Insert phase
     auto a0 = Clock::now();
-    likd.addPoints(batch);
+    likdAdd(likd, batch, frames + 1);
     auto a1 = Clock::now();
     ikd->Add_Points(batch, false);
     auto a2 = Clock::now();
@@ -315,6 +400,29 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
   auto w0 = Clock::now();
   likd.waitForRebuild();
   double wait_ms = elapsedMs(w0, Clock::now());
+  LikdTree::RebuildStats rs = likd.rebuildStats();
+
+#ifdef LIKD_BENCH_STAMPS
+  if (touch) {
+    std::vector<double> ratio;
+    for (size_t i = 0; i < touch_ms.size(); ++i)
+      ratio.push_back(touch_ms[i] / L.frame_inserts[i]);
+    printf("  frames: %zu x %zu points, %.0f neighbors per frame, %.1f%% distinct\n",
+           frames, frame, double(neighbors) / frames, 100.0 * distinct / neighbors);
+    printLikd("Touch total", sumOf(touch_ms), "ms");
+    printLikd("Touch slowest 1% (mean)", slowestPercentMean(touch_ms), "ms");
+    printLikd("Touch worst frame", *std::max_element(touch_ms.begin(), touch_ms.end()),
+              "ms");
+    printLikd("Insert total", L.insert, "ms");
+    printLikd("Touch / insert, total", sumOf(touch_ms) / L.insert, "x");
+    printLikd("Touch / insert, median frame", median(ratio), "x");
+    printLikdCount("Rebuild rounds", rs.rounds, "");
+    printLikdCount("Most writes queued", rs.max_queued_ops, "ops");
+    printLikd("Longest queued-write wait", rs.max_queued_ms, "ms");
+    delete ikd;
+    return;
+  }
+#endif
 
   printf("  frames: %zu x %zu points\n", frames, frame);
   printRow("Build (first frame)", L.build, I.build);
@@ -335,7 +443,6 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
   printf("  likd-tree final wait for rebuild: %.2f ms\n", wait_ms);
   printf("  5-NN answers from a map with queued writes (likd-tree): %.3f%%\n",
          100.0 * stale / total);
-  LikdTree::RebuildStats rs = likd.rebuildStats();
   printLikdCount("Rebuild rounds", rs.rounds, "");
   printLikd("Longest rebuild round", rs.max_round_ms, "ms");
   printLikdCount("Most writes queued", rs.max_queued_ops, "ops");
@@ -344,7 +451,8 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
 }
 
 // The same frames and box deletions as runStream, fed into one tree alone and
-// without queries. end_frame runs after each frame.
+// without queries. add gets each frame and its number; end_frame runs after
+// each frame.
 template <typename Build, typename Add, typename DeleteBoxes, typename EndFrame>
 void feed(const PointVector<PointType>& pts, size_t frame, float local_map_half,
           Build build, Add add, DeleteBoxes delete_boxes, EndFrame end_frame) {
@@ -353,7 +461,7 @@ void feed(const PointVector<PointType>& pts, size_t frame, float local_map_half,
   for (size_t s = frame; s < pts.size(); s += frame, ++frames) {
     PointVector<PointType> batch(pts.begin() + s,
                                  pts.begin() + std::min(s + frame, pts.size()));
-    add(batch);
+    add(batch, frames + 1);
     if (local_map_half > 0 && frames % 10 == 9)
       delete_boxes(localMapBoxes(batch, local_map_half));
     end_frame();
@@ -373,8 +481,10 @@ void streamMemory(const PointVector<PointType>& pts, size_t frame,
     MemorySample before = MemorySample::now();
     LikdTree likd;
     feed(pts, frame, local_map_half,
-         [&](const PointVector<PointType>& f) { likd.build(f); },
-         [&](const PointVector<PointType>& b) { likd.addPoints(b); },
+         [&](const PointVector<PointType>& f) { likdBuild(likd, f); },
+         [&](const PointVector<PointType>& b, uint32_t frame) {
+           likdAdd(likd, b, frame);
+         },
          [&](const std::vector<LikdTree::AABB>& boxes) { likd.deleteBoxes(boxes); },
          [&] { likd.waitForRebuild(); });
     MemorySample after = MemorySample::now();
@@ -389,7 +499,7 @@ void streamMemory(const PointVector<PointType>& pts, size_t frame,
     MemorySample before = MemorySample::now();
     feed(pts, frame, local_map_half,
          [&](const PointVector<PointType>& f) { ikd->Build(f); },
-         [&](PointVector<PointType>& b) { ikd->Add_Points(b, false); },
+         [&](PointVector<PointType>& b, uint32_t) { ikd->Add_Points(b, false); },
          [&](const std::vector<LikdTree::AABB>& boxes) {
            std::vector<BoxPointType> b = toIkdBoxes(boxes);
            ikd->Delete_Point_Boxes(b);
@@ -407,6 +517,69 @@ void streamMemory(const PointVector<PointType>& pts, size_t frame,
   printRow("RSS growth per valid point", likd_rss, ikd_rss, "B/pt");
   printLikd("memoryUsage() per valid pt", likd_usage, "B/pt");
 }
+
+#ifdef LIKD_BENCH_STAMPS
+// Frames kept by Part 5's time-to-live: about as many points as Part 3's
+// 100 m cube keeps on the sparse map
+constexpr uint32_t kTtlFrames = 50;
+
+// Part 3's frames, likd-tree alone, with a time-to-live instead of a local
+// map box: every 10 frames, expire what was stamped more than kTtlFrames
+// frames ago. 5-NN queries run without and with a min_stamp of half that age.
+// An expiry is one write: queued behind a running rebuild it would cost the
+// caller nothing, so each waits for the rebuild first (untimed) and the time
+// is that of the expiry itself.
+void ttlStream(const PointVector<PointType>& pts, size_t frame) {
+  LikdTree likd;
+  likdBuild(likd, PointVector<PointType>(pts.begin(), pts.begin() + frame));
+  LikdTree::SearchOptions recent;
+  double expire = 0, knn = 0, knn_recent = 0;
+  long differ = 0, total_answers = 0;
+  uint32_t f = 0;
+  for (size_t s = frame; s < pts.size(); s += frame) {
+    ++f;
+    PointVector<PointType> batch(pts.begin() + s,
+                                 pts.begin() + std::min(s + frame, pts.size()));
+    recent.min_stamp = LikdTree::Stamp{f > kTtlFrames / 2 ? f - kTtlFrames / 2 : 0};
+    std::vector<float> all(batch.size()), only_recent(batch.size());
+    PointVector<PointType> res;
+    std::vector<float> d;
+    auto q0 = Clock::now();
+    for (size_t i = 0; i < batch.size(); ++i) {
+      likd.knnSearch(batch[i], K, res, d);
+      all[i] = d.empty() ? INFINITY : d.back();
+    }
+    auto q1 = Clock::now();
+    for (size_t i = 0; i < batch.size(); ++i) {
+      likd.knnSearch(batch[i], K, res, d, recent);
+      only_recent[i] = d.empty() ? INFINITY : d.back();
+    }
+    auto q2 = Clock::now();
+    knn += elapsedMs(q0, q1);
+    knn_recent += elapsedMs(q1, q2);
+    for (size_t i = 0; i < batch.size(); ++i, ++total_answers)
+      differ += !(std::fabs(all[i] - only_recent[i]) <= 1e-3f);
+    likdAdd(likd, batch, f);
+    if (f % 10 == 0 && f > kTtlFrames) {
+      likd.waitForRebuild();
+      auto e0 = Clock::now();
+      likd.expireBefore(LikdTree::Stamp{f - kTtlFrames});
+      expire += elapsedMs(e0, Clock::now());
+    }
+  }
+  likd.waitForRebuild();
+  long removed = static_cast<long>(pts.size()) - likd.size();
+  printf("  frames: %u x %zu points, time to live %u frames, expired every 10\n",
+         f, frame, kTtlFrames);
+  printLikd("Expire total", expire, "ms");
+  printLikd("Expire per point removed", 1e6 * expire / std::max(1L, removed), "ns");
+  printLikdCount("Points kept", likd.size(), "");
+  printLikdCount("Points removed", removed, "");
+  printLikd("5-NN query total (seq)", knn, "ms");
+  printLikd("5-NN, recent half (seq)", knn_recent, "ms");
+  printLikd("5-NN answers that differ", 100.0 * differ / total_answers, "%");
+}
+#endif
 
 #ifdef LIKD_BENCH_NANOFLANN
 // What leaf buckets and pooled nodes give a static tree, which supports no
@@ -530,7 +703,7 @@ int main(int argc, char** argv) {
     releaseFreeMemory();
     MemorySample m0 = MemorySample::now();
     auto t0 = Clock::now();
-    likd.build(pts);
+    likdBuild(likd, pts);
     auto t1 = Clock::now();
     MemorySample m1 = MemorySample::now();
     IkdTree* ikd = new IkdTree();  // operation queue allocated here, not counted
@@ -642,5 +815,15 @@ int main(int argc, char** argv) {
     runStream(pts, frame, 50.0f);
     streamMemory(pts, frame, 50.0f);
   }
+#ifdef LIKD_BENCH_STAMPS
+  std::cout << "\n=== Part 4: Part 2 again, likd-tree touching each frame's "
+               "5-NN neighbors ===" << std::endl;
+  runStream(pts, frame, 0.0f, /*touch=*/true);
+  if (map) {
+    std::cout << "\n=== Part 5: Part 3's frames with a time to live instead "
+                 "of a box (likd-tree only) ===" << std::endl;
+    ttlStream(pts, frame);
+  }
+#endif
   return 0;
 }
