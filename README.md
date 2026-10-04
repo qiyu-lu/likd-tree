@@ -133,6 +133,11 @@ tree.boxSearch(box, results);
 // Delete points (exact coordinates) or everything inside boxes
 tree.deletePoints(points_to_remove);
 tree.deleteBox(box);
+
+// Points stored, and bytes held by the tree (including deleted points that
+// a rebuild has not reclaimed yet)
+int n = tree.size();
+size_t bytes = tree.memoryUsage();
 ```
 
 **To enable TBB parallel acceleration:**
@@ -333,6 +338,39 @@ cmake -B build -DBUILD_BENCHMARK=ON
 cmake --build build
 ./build/benchmark
 ```
+
+CMake gets ikd-Tree through the git submodule, or downloads it. Without
+network access, compile against a local ikd-Tree checkout instead:
+
+```bash
+g++ -std=c++17 -O3 test/benchmark.cpp <ikd-Tree>/ikd-Tree/ikd_Tree.cpp \
+  -I<ikd-Tree>/ikd-Tree -Isrc -I/usr/include/eigen3 -I/usr/include/pcl-1.10 \
+  -lpcl_io -lpcl_common -lboost_system -ltbb -lpthread -o build/benchmark
+```
+
+Besides timings, the benchmark reports memory per point: heap growth from
+glibc's `mallinfo()`, RSS growth, and `memoryUsage()`. It also defines
+`LIKD_TREE_STATS`, so it reports the longest background rebuild and how long a
+queued write waited before queries could see it. To compare against static
+nanoflann trees (1.5.0 or newer) as well, pass
+`-DNANOFLANN_INCLUDE_DIR=<dir>` to CMake, or add
+`-DLIKD_BENCH_NANOFLANN -I<dir>` to the command above.
+
+**Comparing two versions.** Single runs on the same machine can differ by 10%
+or more, so a few runs of each version can't show a 5% change.
+Keep an executable built from the baseline, run it and the new one
+alternately at least five times each, and compare the medians:
+
+```bash
+cp build/benchmark build/benchmark_base    # built from the baseline commit
+# ...rebuild build/benchmark from the new version...
+python3 test/compare_benchmarks.py build/benchmark_base build/benchmark \
+    --map test/pcd/globalMap.pcd --runs 5
+```
+
+Passing the same executable twice shows the noise floor. The ikd-tree code is
+identical in both executables, so its new/base ratio shows how much the
+machine drifted during the comparison.
 
 ### Rebuild visualization demo
 
