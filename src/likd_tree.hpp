@@ -63,8 +63,20 @@ struct PointTraits {
 template <typename PointType>
 using PointVector = std::vector<PointType, Eigen::aligned_allocator<PointType>>;
 
-template <typename PointType, typename Traits = PointTraits<PointType>>
+// Compile-time options. To change one, derive from this struct and override
+// it, e.g. struct MyOptions : DefaultOptions { static constexpr int LEAF_SIZE
+// = 64; }, then use KDTree<PointType, PointTraits<PointType>, MyOptions>.
+struct DefaultOptions {
+  // Points stored in each leaf, 2 to 64
+  static constexpr int LEAF_SIZE = 32;
+};
+
+template <typename PointType, typename Traits = PointTraits<PointType>,
+          typename Options = DefaultOptions>
 class KDTree {
+  static constexpr int LeafSize = Options::LEAF_SIZE;
+  static_assert(LeafSize >= 2 && LeafSize <= 64, "LEAF_SIZE must be 2 to 64");
+
  public:
   struct AABB {
     std::array<float, Traits::DIM> min, max;
@@ -252,38 +264,38 @@ class KDTree {
 };
 
 // AABB: axis-aligned bounding boxes
-template <typename PointType, typename Traits>
-KDTree<PointType, Traits>::AABB::AABB() {
+template <typename PointType, typename Traits, typename Options>
+KDTree<PointType, Traits, Options>::AABB::AABB() {
   for (int i = 0; i < Traits::DIM; ++i) {
     min[i] = std::numeric_limits<float>::max();
     max[i] = std::numeric_limits<float>::lowest();
   }
 }
 
-template <typename PointType, typename Traits>
-KDTree<PointType, Traits>::AABB::AABB(
+template <typename PointType, typename Traits, typename Options>
+KDTree<PointType, Traits, Options>::AABB::AABB(
     const std::array<float, Traits::DIM>& min_corner,
     const std::array<float, Traits::DIM>& max_corner)
     : min(min_corner), max(max_corner) {}
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::AABB::expand(const PointType& pt) {
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::AABB::expand(const PointType& pt) {
   for (int i = 0; i < Traits::DIM; ++i) {
     min[i] = std::min(min[i], Traits::coord(pt, i));
     max[i] = std::max(max[i], Traits::coord(pt, i));
   }
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::AABB::expand(const AABB& box) {
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::AABB::expand(const AABB& box) {
   for (int i = 0; i < Traits::DIM; ++i) {
     min[i] = std::min(min[i], box.min[i]);
     max[i] = std::max(max[i], box.max[i]);
   }
 }
 
-template <typename PointType, typename Traits>
-float KDTree<PointType, Traits>::AABB::sqrDist(const PointType& pt) const {
+template <typename PointType, typename Traits, typename Options>
+float KDTree<PointType, Traits, Options>::AABB::sqrDist(const PointType& pt) const {
   float d2 = 0;
   for (int i = 0; i < Traits::DIM; ++i) {
     float v = Traits::coord(pt, i);
@@ -295,8 +307,8 @@ float KDTree<PointType, Traits>::AABB::sqrDist(const PointType& pt) const {
   return d2;
 }
 
-template <typename PointType, typename Traits>
-bool KDTree<PointType, Traits>::AABB::contains(const PointType& pt) const {
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::AABB::contains(const PointType& pt) const {
   for (int i = 0; i < Traits::DIM; ++i) {
     float v = Traits::coord(pt, i);
     if (v < min[i] || v > max[i])
@@ -305,8 +317,8 @@ bool KDTree<PointType, Traits>::AABB::contains(const PointType& pt) const {
   return true;
 }
 
-template <typename PointType, typename Traits>
-bool KDTree<PointType, Traits>::AABB::contains(const AABB& box) const {
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::AABB::contains(const AABB& box) const {
   for (int i = 0; i < Traits::DIM; ++i) {
     if (box.min[i] < min[i] || box.max[i] > max[i])
       return false;
@@ -314,8 +326,8 @@ bool KDTree<PointType, Traits>::AABB::contains(const AABB& box) const {
   return true;
 }
 
-template <typename PointType, typename Traits>
-bool KDTree<PointType, Traits>::AABB::intersects(const AABB& box) const {
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::AABB::intersects(const AABB& box) const {
   for (int i = 0; i < Traits::DIM; ++i) {
     if (box.max[i] < min[i] || box.min[i] > max[i])
       return false;
@@ -323,17 +335,17 @@ bool KDTree<PointType, Traits>::AABB::intersects(const AABB& box) const {
   return true;
 }
 
-template <typename PointType, typename Traits>
-KDTree<PointType, Traits>::Node::Node(const PointType& pt, int ax)
+template <typename PointType, typename Traits, typename Options>
+KDTree<PointType, Traits, Options>::Node::Node(const PointType& pt, int ax)
     : point(pt), axis(ax) {
   aabb.expand(pt);
 }
 
-template <typename PointType, typename Traits>
-KDTree<PointType, Traits>::KDTree() : root_(nullptr) {}
+template <typename PointType, typename Traits, typename Options>
+KDTree<PointType, Traits, Options>::KDTree() : root_(nullptr) {}
 
-template <typename PointType, typename Traits>
-KDTree<PointType, Traits>::~KDTree() {
+template <typename PointType, typename Traits, typename Options>
+KDTree<PointType, Traits, Options>::~KDTree() {
   {
     std::unique_lock<std::mutex> lock(pending_mutex_);
     idle_cv_.wait(lock, [this] { return !rebuilding_.load(); });
@@ -345,8 +357,8 @@ KDTree<PointType, Traits>::~KDTree() {
   destroy(root_);
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::build(const PointVector<PointType>& pts) {
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::build(const PointVector<PointType>& pts) {
   std::lock_guard<std::mutex> write_lock(write_mutex_);
   // The worker may still hold pointers into the current tree
   waitForRebuild();
@@ -363,9 +375,9 @@ void KDTree<PointType, Traits>::build(const PointVector<PointType>& pts) {
 
 // Runs apply_now(candidates) on the tree, or enqueue(pending_ops_) while a
 // rebuild is running, then hands any unbalanced subtrees to the worker.
-template <typename PointType, typename Traits>
+template <typename PointType, typename Traits, typename Options>
 template <typename ApplyFn, typename EnqueueFn>
-void KDTree<PointType, Traits>::write(ApplyFn&& apply_now, EnqueueFn&& enqueue,
+void KDTree<PointType, Traits, Options>::write(ApplyFn&& apply_now, EnqueueFn&& enqueue,
                                       bool wait_for_rebuild) {
   std::lock_guard<std::mutex> write_lock(write_mutex_);
   bool buffered = false;
@@ -416,8 +428,8 @@ void KDTree<PointType, Traits>::write(ApplyFn&& apply_now, EnqueueFn&& enqueue,
   }
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::addPoints(const PointVector<PointType>& pts,
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::addPoints(const PointVector<PointType>& pts,
                                           bool wait_for_rebuild) {
   write(
       [&](std::vector<Node*>* candidates) {
@@ -433,8 +445,8 @@ void KDTree<PointType, Traits>::addPoints(const PointVector<PointType>& pts,
       wait_for_rebuild);
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::deletePoints(const PointVector<PointType>& pts,
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::deletePoints(const PointVector<PointType>& pts,
                                              bool wait_for_rebuild) {
   write(
       [&](std::vector<Node*>* candidates) {
@@ -450,8 +462,8 @@ void KDTree<PointType, Traits>::deletePoints(const PointVector<PointType>& pts,
       wait_for_rebuild);
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::deleteBoxes(const std::vector<AABB>& boxes,
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::deleteBoxes(const std::vector<AABB>& boxes,
                                             bool wait_for_rebuild) {
   write(
       [&](std::vector<Node*>* candidates) {
@@ -467,15 +479,15 @@ void KDTree<PointType, Traits>::deleteBoxes(const std::vector<AABB>& boxes,
       wait_for_rebuild);
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::deleteBox(const AABB& box,
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::deleteBox(const AABB& box,
                                           bool wait_for_rebuild) {
   deleteBoxes(std::vector<AABB>{box}, wait_for_rebuild);
 }
 
-template <typename PointType, typename Traits>
+template <typename PointType, typename Traits, typename Options>
 std::pair<std::optional<PointType>, float>
-KDTree<PointType, Traits>::nearestNeighbors(const PointType& query) const {
+KDTree<PointType, Traits, Options>::nearestNeighbors(const PointType& query) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
 
   if (root_ == nullptr || root_->valid_size == 0) {
@@ -488,8 +500,8 @@ KDTree<PointType, Traits>::nearestNeighbors(const PointType& query) const {
   return {*best_pt, std::sqrt(best_dist2)};
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::nearestNeighbors(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::nearestNeighbors(
     const PointVector<PointType>& queries, PointVector<PointType>& results,
     std::vector<float>& distances) const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
@@ -514,8 +526,8 @@ void KDTree<PointType, Traits>::nearestNeighbors(
   });
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::radiusSearch(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::radiusSearch(
     const PointType& query, float radius, PointVector<PointType>& results,
     std::vector<float>& distances) const {
   results.clear();
@@ -563,8 +575,8 @@ void KDTree<PointType, Traits>::radiusSearch(
   distances.swap(sorted_distances);
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::knnSearch(const PointType& query, int k,
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::knnSearch(const PointType& query, int k,
                                           PointVector<PointType>& results,
                                           std::vector<float>& distances,
                                           float max_dist) const {
@@ -572,8 +584,8 @@ void KDTree<PointType, Traits>::knnSearch(const PointType& query, int k,
   knnSearchLocked(query, k, max_dist, results, distances);
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::knnSearch(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::knnSearch(
     const PointVector<PointType>& queries, int k,
     std::vector<PointVector<PointType>>& results,
     std::vector<std::vector<float>>& distances, float max_dist) const {
@@ -589,8 +601,8 @@ void KDTree<PointType, Traits>::knnSearch(
 }
 
 // Caller holds tree_mutex_ (shared)
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::knnSearchLocked(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::knnSearchLocked(
     const PointType& query, int k, float max_dist,
     PointVector<PointType>& results, std::vector<float>& distances) const {
   results.clear();
@@ -613,49 +625,49 @@ void KDTree<PointType, Traits>::knnSearchLocked(
   }
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::boxSearch(const AABB& box,
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::boxSearch(const AABB& box,
                                           PointVector<PointType>& results) const {
   results.clear();
   std::shared_lock<SharedMutex> lock(tree_mutex_);
   boxSearchInternal(root_, box, results);
 }
 
-template <typename PointType, typename Traits>
-int KDTree<PointType, Traits>::size() const {
+template <typename PointType, typename Traits, typename Options>
+int KDTree<PointType, Traits, Options>::size() const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
   return root_ ? root_->valid_size : 0;
 }
 
-template <typename PointType, typename Traits>
-int KDTree<PointType, Traits>::nodeCount() const {
+template <typename PointType, typename Traits, typename Options>
+int KDTree<PointType, Traits, Options>::nodeCount() const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
   return root_ ? root_->subtree_size : 0;
 }
 
-template <typename PointType, typename Traits>
-size_t KDTree<PointType, Traits>::memoryUsage() const {
+template <typename PointType, typename Traits, typename Options>
+size_t KDTree<PointType, Traits, Options>::memoryUsage() const {
   std::shared_lock<SharedMutex> lock(tree_mutex_);
   return root_ ? static_cast<size_t>(root_->subtree_size) * sizeof(Node) : 0;
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::waitForRebuild() const {
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::waitForRebuild() const {
   std::unique_lock<std::mutex> lock(pending_mutex_);
   idle_cv_.wait(lock, [this] { return !rebuilding_.load(); });
 }
 
 #ifdef LIKD_TREE_STATS
-template <typename PointType, typename Traits>
-typename KDTree<PointType, Traits>::RebuildStats
-KDTree<PointType, Traits>::rebuildStats() const {
+template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::RebuildStats
+KDTree<PointType, Traits, Options>::rebuildStats() const {
   std::lock_guard<std::mutex> lock(pending_mutex_);
   return stats_;
 }
 #endif
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::applyOp(const Op& op,
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::applyOp(const Op& op,
                                         std::vector<Node*>* candidates) {
   switch (op.type) {
     case OpType::kInsert:
@@ -670,9 +682,9 @@ void KDTree<PointType, Traits>::applyOp(const Op& op,
   }
 }
 
-template <typename PointType, typename Traits>
-typename KDTree<PointType, Traits>::Node*
-KDTree<PointType, Traits>::insertInternal(Node* node, const PointType& pt,
+template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::Node*
+KDTree<PointType, Traits, Options>::insertInternal(Node* node, const PointType& pt,
                                           int depth,
                                           std::vector<Node*>* candidates) {
   if (!node)
@@ -698,8 +710,8 @@ KDTree<PointType, Traits>::insertInternal(Node* node, const PointType& pt,
 // Descends by bounding box rather than by the split comparison: nth_element
 // leaves points equal to the median on both sides, so "equal goes right"
 // would miss them.
-template <typename PointType, typename Traits>
-bool KDTree<PointType, Traits>::deletePointInternal(
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::deletePointInternal(
     Node* node, const PointType& pt, std::vector<Node*>* candidates) {
   if (!node || node->valid_size == 0 || !node->aabb.contains(pt))
     return false;
@@ -719,8 +731,8 @@ bool KDTree<PointType, Traits>::deletePointInternal(
 }
 
 // Returns the number of points deleted
-template <typename PointType, typename Traits>
-int KDTree<PointType, Traits>::deleteBoxInternal(
+template <typename PointType, typename Traits, typename Options>
+int KDTree<PointType, Traits, Options>::deleteBoxInternal(
     Node* node, const AABB& box, std::vector<Node*>* candidates) {
   if (!node || node->valid_size == 0 || !box.intersects(node->aabb))
     return 0;
@@ -746,16 +758,16 @@ int KDTree<PointType, Traits>::deleteBoxInternal(
   return removed;
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::killSubtree(Node* node) {
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::killSubtree(Node* node) {
   node->tree_deleted = true;
   node->valid_size = 0;
   node->aabb = AABB();
 }
 
 // Called by writers before descending into a node
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::pushDown(Node* node) {
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::pushDown(Node* node) {
   if (!node->tree_deleted)
     return;
   node->deleted = true;
@@ -766,8 +778,8 @@ void KDTree<PointType, Traits>::pushDown(Node* node) {
   node->tree_deleted = false;
 }
 
-template <typename PointType, typename Traits>
-bool KDTree<PointType, Traits>::samePoint(const PointType& a,
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::samePoint(const PointType& a,
                                           const PointType& b) {
   for (int i = 0; i < Traits::DIM; ++i) {
     if (Traits::coord(a, i) != Traits::coord(b, i))
@@ -776,8 +788,8 @@ bool KDTree<PointType, Traits>::samePoint(const PointType& a,
   return true;
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::update(Node* node) {
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::update(Node* node) {
   node->subtree_size = 1;
   if (node->left) {
     node->subtree_size += node->left->subtree_size;
@@ -802,8 +814,8 @@ void KDTree<PointType, Traits>::update(Node* node) {
   }
 }
 
-template <typename PointType, typename Traits>
-bool KDTree<PointType, Traits>::needRebuild(Node* node) const {
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::needRebuild(Node* node) const {
   if (node->subtree_size < MIN_SUB_NUM)
     return false;
   int lsz = node->left ? node->left->subtree_size : 0;
@@ -816,8 +828,8 @@ bool KDTree<PointType, Traits>::needRebuild(Node* node) const {
 
 // Only set need_rebuild to true, never clear it
 // Only delete a node marked by need_rebuild in rebuilding thread
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::markIfUnbalanced(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::markIfUnbalanced(
     Node* node, std::vector<Node*>* candidates) {
   if (candidates && !node->need_rebuild && needRebuild(node)) {
     node->need_rebuild = true;
@@ -827,8 +839,8 @@ void KDTree<PointType, Traits>::markIfUnbalanced(
 
 // Appends the non-deleted points. Iterative: an unbalanced chain must not
 // overflow the stack.
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::collect(Node* node,
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::collect(Node* node,
                                         PointVector<PointType>& pts) const {
   if (!node)
     return;
@@ -847,8 +859,8 @@ void KDTree<PointType, Traits>::collect(Node* node,
   }
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::destroy(Node* node) {
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::destroy(Node* node) {
   std::vector<Node*> stack;
   if (node)
     stack.push_back(node);
@@ -863,9 +875,9 @@ void KDTree<PointType, Traits>::destroy(Node* node) {
   }
 }
 
-template <typename PointType, typename Traits>
-typename KDTree<PointType, Traits>::Node*
-KDTree<PointType, Traits>::buildRecursive(PointVector<PointType>& pts, size_t l,
+template <typename PointType, typename Traits, typename Options>
+typename KDTree<PointType, Traits, Options>::Node*
+KDTree<PointType, Traits, Options>::buildRecursive(PointVector<PointType>& pts, size_t l,
                                           size_t r) {
   if (l >= r)
     return nullptr;
@@ -909,8 +921,8 @@ KDTree<PointType, Traits>::buildRecursive(PointVector<PointType>& pts, size_t l,
 }
 
 // Called only on nodes with valid_size > 0
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::nearestNeighborInternal(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::nearestNeighborInternal(
     Node* node, const PointType& query, const PointType*& best_pt,
     float& best_dist2) const {
   if (!node->deleted) {
@@ -931,8 +943,8 @@ void KDTree<PointType, Traits>::nearestNeighborInternal(
     nearestNeighborInternal(far, query, best_pt, best_dist2);
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::radiusSearchInternal(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::radiusSearchInternal(
     Node* node, const PointType& query, float radius2,
     PointVector<PointType>& results, std::vector<float>& distances2) const {
   if (!node || node->valid_size == 0 || node->aabb.sqrDist(query) > radius2)
@@ -951,8 +963,8 @@ void KDTree<PointType, Traits>::radiusSearchInternal(
 }
 
 // Called only on nodes with valid_size > 0
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::knnSearchInternal(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::knnSearchInternal(
     Node* node, const PointType& query, size_t k, float max_dist2,
     std::vector<std::pair<float, const PointType*>>& best) const {
   if (!node->deleted) {
@@ -984,8 +996,8 @@ void KDTree<PointType, Traits>::knnSearchInternal(
     knnSearchInternal(far, query, k, max_dist2, best);
 }
 
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::boxSearchInternal(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::boxSearchInternal(
     Node* node, const AABB& box, PointVector<PointType>& results) const {
   if (!node || node->valid_size == 0 || !box.intersects(node->aabb))
     return;
@@ -1001,8 +1013,8 @@ void KDTree<PointType, Traits>::boxSearchInternal(
   boxSearchInternal(node->right, box, results);
 }
 
-template <typename PointType, typename Traits>
-bool KDTree<PointType, Traits>::checkAncestorNeedsRebuild(Node* node) const {
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::checkAncestorNeedsRebuild(Node* node) const {
   Node* ancestor = node->parent;
   bool needs_rebuild = false;
   while (ancestor) {
@@ -1016,9 +1028,9 @@ bool KDTree<PointType, Traits>::checkAncestorNeedsRebuild(Node* node) const {
 }
 
 // Filter: remove nodes whose ancestors also need rebuild
-template <typename PointType, typename Traits>
-std::vector<typename KDTree<PointType, Traits>::Node*>
-KDTree<PointType, Traits>::topmostCandidates(
+template <typename PointType, typename Traits, typename Options>
+std::vector<typename KDTree<PointType, Traits, Options>::Node*>
+KDTree<PointType, Traits, Options>::topmostCandidates(
     const std::vector<Node*>& candidates) const {
   std::vector<Node*> topmost;
   for (Node* candidate : candidates) {
@@ -1032,8 +1044,8 @@ KDTree<PointType, Traits>::topmostCandidates(
 // Runs on the worker thread while rebuilding_ is set, i.e. while every writer
 // is diverted to pending_ops_: the old subtrees can be read without the tree
 // lock.
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::rebuildSubtrees(
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::rebuildSubtrees(
     const std::vector<Node*>& nodes_to_rebuild) {
   // Pre-allocate new_nodes for thread-safe parallel access
   std::vector<Node*> new_nodes(nodes_to_rebuild.size());
@@ -1087,8 +1099,8 @@ void KDTree<PointType, Traits>::rebuildSubtrees(
 }
 
 // Background rebuild thread: started on the first rebuild, joined in ~KDTree
-template <typename PointType, typename Traits>
-void KDTree<PointType, Traits>::workerLoop() {
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::workerLoop() {
   std::unique_lock<std::mutex> lock(pending_mutex_);
   while (true) {
     job_cv_.wait(lock, [this] { return stop_ || !rebuild_job_.empty(); });

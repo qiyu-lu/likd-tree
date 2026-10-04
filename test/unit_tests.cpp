@@ -1,5 +1,8 @@
 // unit_tests.cpp - correctness and thread-safety tests for likd-tree.
 // Every query is checked against brute force. Returns non-zero on failure.
+// The brute-force tests run for leaf sizes 2, 4, 32 (the default) and 64:
+// small leaves split and rebuild often. The concurrency tests run for leaf
+// sizes 2 and 32.
 
 #include <algorithm>
 #include <atomic>
@@ -16,8 +19,14 @@ namespace {
 struct Pt {
   float x, y, z;
 };
-using Tree = KDTree<Pt>;
 using Points = PointVector<Pt>;
+
+template <int N>
+struct LeafOptions : DefaultOptions {
+  static constexpr int LEAF_SIZE = N;
+};
+template <int N>
+using LeafTree = KDTree<Pt, PointTraits<Pt>, LeafOptions<N>>;
 
 int g_failures = 0;
 
@@ -45,12 +54,23 @@ Points blob(std::mt19937& rng, size_t n, float spread = 3.0f) {
   return pts;
 }
 
+// Gaussian blob around a given center
+Points cluster(std::mt19937& rng, size_t n, Pt c, float spread) {
+  std::normal_distribution<float> noise(0.0f, spread);
+  Points pts(n);
+  for (auto& p : pts) {
+    p = {c.x + noise(rng), c.y + noise(rng), c.z + noise(rng)};
+  }
+  return pts;
+}
+
 float bruteNearest(const Points& pts, const Pt& q) {
   float best = INFINITY;
   for (const auto& p : pts) best = std::min(best, dist(p, q));
   return best;
 }
 
+template <typename Tree>
 bool matchesBruteForce(const Tree& tree, const Points& all, std::mt19937& rng,
                        int num_queries) {
   std::uniform_real_distribution<float> u(-60.0f, 60.0f);
@@ -92,6 +112,18 @@ bool sameDistances(const std::vector<float>& a, const std::vector<float>& b) {
   return true;
 }
 
+// Removes one copy of p from the model, if there is one
+void eraseOne(Points& model, const Pt& p) {
+  auto it = std::find_if(model.begin(), model.end(), [&](const Pt& m) {
+    return m.x == p.x && m.y == p.y && m.z == p.z;
+  });
+  if (it != model.end()) {
+    *it = model.back();
+    model.pop_back();
+  }
+}
+
+template <typename Tree>
 void testIncrementalQueries() {
   std::printf("[incremental queries]\n");
   std::mt19937 rng(1);
@@ -111,6 +143,7 @@ void testIncrementalQueries() {
   CHECK(empty.size() == 0);
 }
 
+template <typename Tree>
 void testKnnSearch() {
   std::printf("[knn search]\n");
   std::mt19937 rng(7);
@@ -157,6 +190,7 @@ void testKnnSearch() {
   CHECK(res.empty() && d.empty());
 }
 
+template <typename Tree>
 void testBoxSearch() {
   std::printf("[box search]\n");
   std::mt19937 rng(8);
@@ -172,7 +206,7 @@ void testBoxSearch() {
   std::uniform_real_distribution<float> half(0.5f, 30.0f);
   for (int i = 0; i < 300; ++i) {
     float cx = u(rng), cy = u(rng), cz = u(rng), h = half(rng);
-    Tree::AABB box({cx - h, cy - h, cz - h}, {cx + h, cy + h, cz + h});
+    typename Tree::AABB box({cx - h, cy - h, cz - h}, {cx + h, cy + h, cz + h});
     Points res;
     tree.boxSearch(box, res);
     size_t expected = std::count_if(all.begin(), all.end(),
@@ -183,9 +217,10 @@ void testBoxSearch() {
   }
   // Box containing everything, and an empty one
   Points res;
-  tree.boxSearch(Tree::AABB({-1e9f, -1e9f, -1e9f}, {1e9f, 1e9f, 1e9f}), res);
+  tree.boxSearch(typename Tree::AABB({-1e9f, -1e9f, -1e9f}, {1e9f, 1e9f, 1e9f}),
+                 res);
   CHECK(res.size() == all.size());
-  tree.boxSearch(Tree::AABB({1e8f, 1e8f, 1e8f}, {1e9f, 1e9f, 1e9f}), res);
+  tree.boxSearch(typename Tree::AABB({1e8f, 1e8f, 1e8f}, {1e9f, 1e9f, 1e9f}), res);
   CHECK(res.empty());
 }
 
@@ -199,6 +234,7 @@ Points gridBlob(std::mt19937& rng, size_t n) {
   return pts;
 }
 
+template <typename Tree>
 bool sameAsModel(const Tree& tree, const Points& model, std::mt19937& rng) {
   if (tree.size() != static_cast<int>(model.size())) return false;
   std::uniform_real_distribution<float> u(-60.0f, 60.0f);
@@ -217,7 +253,7 @@ bool sameAsModel(const Tree& tree, const Points& model, std::mt19937& rng) {
     size_t in_radius = 0;
     for (const auto& p : model) in_radius += dist(p, q) <= 8.0f;
     if (res.size() != in_radius) return false;
-    Tree::AABB box({q.x - 6, q.y - 6, q.z - 6}, {q.x + 6, q.y + 6, q.z + 6});
+    typename Tree::AABB box({q.x - 6, q.y - 6, q.z - 6}, {q.x + 6, q.y + 6, q.z + 6});
     tree.boxSearch(box, res);
     size_t in_box = std::count_if(model.begin(), model.end(),
                                   [&](const Pt& p) { return box.contains(p); });
@@ -228,6 +264,7 @@ bool sameAsModel(const Tree& tree, const Points& model, std::mt19937& rng) {
 
 // Random inserts, point deletes and box deletes against a brute-force model.
 // Without wait_for_rebuild, many writes land in the queue of a running rebuild.
+template <typename Tree>
 void testDeleteDifferential() {
   std::printf("[delete: differential]\n");
   std::mt19937 rng(9);
@@ -247,18 +284,10 @@ void testDeleteDifferential() {
         del.push_back(model[rng() % model.size()]);
       del.push_back({1000.0f, 1000.0f, 1000.0f});  // absent: no-op
       tree.deletePoints(del);
-      for (const auto& p : del) {
-        auto it = std::find_if(model.begin(), model.end(), [&](const Pt& m) {
-          return m.x == p.x && m.y == p.y && m.z == p.z;
-        });
-        if (it != model.end()) {
-          *it = model.back();
-          model.pop_back();
-        }
-      }
+      for (const auto& p : del) eraseOne(model, p);
     } else {
       float cx = u(rng), cy = u(rng), h = 2.0f + rng() % 15;
-      Tree::AABB box({cx - h, cy - h, -100.0f}, {cx + h, cy + h, 100.0f});
+      typename Tree::AABB box({cx - h, cy - h, -100.0f}, {cx + h, cy + h, 100.0f});
       tree.deleteBox(box);
       model.erase(std::remove_if(model.begin(), model.end(),
                                  [&](const Pt& p) { return box.contains(p); }),
@@ -271,11 +300,12 @@ void testDeleteDifferential() {
   }
   tree.waitForRebuild();
   CHECK(sameAsModel(tree, model, rng));
-  // Rebuilds reclaim deleted nodes
+  // Rebuilds reclaim deleted points
   CHECK(tree.nodeCount() <= 2 * tree.size() + 64);
 }
 
 // Every point deleted once by value, with many ties on split values.
+template <typename Tree>
 void testDeleteTies() {
   std::printf("[delete: tied coordinates]\n");
   std::mt19937 rng(10);
@@ -287,12 +317,14 @@ void testDeleteTies() {
   CHECK(!tree.nearestNeighbors(Pt{0, 0, 0}).first);
 }
 
+template <typename Tree>
 void testDeleteAll() {
   std::printf("[delete: everything, then reuse]\n");
   std::mt19937 rng(11);
   Tree tree;
   tree.build(blob(rng, 5000));
-  tree.deleteBox(Tree::AABB({-1e9f, -1e9f, -1e9f}, {1e9f, 1e9f, 1e9f}), true);
+  tree.deleteBox(typename Tree::AABB({-1e9f, -1e9f, -1e9f}, {1e9f, 1e9f, 1e9f}),
+                 true);
   CHECK(tree.size() == 0);
   CHECK(tree.nodeCount() == 0);
   CHECK(tree.memoryUsage() == 0);
@@ -310,6 +342,7 @@ void testDeleteAll() {
 }
 
 // Deleting most points and letting the rebuild reclaim them shrinks the memory.
+template <typename Tree>
 void testMemoryUsage() {
   std::printf("[memory usage]\n");
   std::mt19937 rng(12);
@@ -323,13 +356,121 @@ void testMemoryUsage() {
   for (const auto& p : pts) xs.push_back(p.x);
   std::nth_element(xs.begin(), xs.begin() + xs.size() * 9 / 10, xs.end());
   float x90 = xs[xs.size() * 9 / 10];
-  tree.deleteBox(Tree::AABB({-1e9f, -1e9f, -1e9f}, {x90, 1e9f, 1e9f}), true);
+  tree.deleteBox(typename Tree::AABB({-1e9f, -1e9f, -1e9f}, {x90, 1e9f, 1e9f}),
+                 true);
   CHECK(tree.size() < static_cast<int>(pts.size()) / 5);
   CHECK(tree.memoryUsage() <= full / 4);
 }
 
+// More identical points than a leaf holds: no split value separates them.
+template <typename Tree>
+void testDuplicates() {
+  std::printf("[duplicates]\n");
+  std::mt19937 rng(14);
+  const Pt same{1.5f, -2.0f, 3.0f};
+  Points model = blob(rng, 500);
+  model.insert(model.end(), 100, same);
+  Tree tree;
+  tree.build(model);
+  // One point per write, so that full leaves of copies keep splitting
+  for (int i = 0; i < 150; ++i) {
+    tree.addPoints(Points{same});
+    model.push_back(same);
+  }
+  tree.addPoints(Points(150, same), true);
+  model.insert(model.end(), 150, same);
+  CHECK(sameAsModel(tree, model, rng));
+  Points res;
+  std::vector<float> d;
+  tree.knnSearch(same, 64, res, d);
+  CHECK(d.size() == 64 && d.back() == 0.0f);
+  tree.radiusSearch(same, 0.0f, res, d);
+  CHECK(res.size() == 400);
+  // Delete the copies one at a time
+  for (int i = 0; i < 400; ++i) {
+    tree.deletePoints(Points{same});
+    eraseOne(model, same);
+    if (i % 100 == 99) {
+      tree.waitForRebuild();
+      CHECK(sameAsModel(tree, model, rng));
+      tree.radiusSearch(same, 0.0f, res, d);
+      CHECK(res.size() == static_cast<size_t>(399 - i));
+    }
+  }
+  tree.deletePoints(Points{same}, true);  // none left: no-op
+  CHECK(tree.size() == static_cast<int>(model.size()));
+}
+
+// Deleting every point of a region, one by one, empties whole leaves; the
+// region then fills up again.
+template <typename Tree>
+void testEmptiedLeaves() {
+  std::printf("[emptied leaves]\n");
+  std::mt19937 rng(15);
+  Points model = blob(rng, 4000, 10.0f);
+  Tree tree;
+  tree.build(model);
+  std::vector<float> xs;
+  for (const auto& p : model) xs.push_back(p.x);
+  std::nth_element(xs.begin(), xs.begin() + xs.size() * 3 / 10, xs.end());
+  float x30 = xs[xs.size() * 3 / 10];
+  Points gone;
+  for (const auto& p : model)
+    if (p.x < x30) gone.push_back(p);
+  tree.deletePoints(gone, true);
+  for (const auto& p : gone) eraseOne(model, p);
+  CHECK(sameAsModel(tree, model, rng));
+  Points back(gone.begin(), gone.begin() + gone.size() / 2);
+  tree.addPoints(back, true);
+  model.insert(model.end(), back.begin(), back.end());
+  CHECK(sameAsModel(tree, model, rng));
+}
+
+// Box deletion tags whole subtrees, and a rebuild can leave an inner node with
+// an empty child. Later inserts land in both kinds of places.
+template <typename Tree>
+void testInsertAfterDeletingSubtrees() {
+  std::printf("[insert after deleting subtrees]\n");
+  std::mt19937 rng(16);
+  const Pt a{-30, 0, 0}, b{30, 0, 0};
+  typename Tree::AABB around_b({20, -15, -15}, {40, 15, 15});
+  typename Tree::AABB half_of_a({-45, -15, -15}, {-30, 15, 15});
+  Points model = cluster(rng, 3000, a, 2.0f);
+  Points bs = cluster(rng, 1000, b, 2.0f);
+  model.insert(model.end(), bs.begin(), bs.end());
+  Tree tree;
+  tree.build(model);
+  auto erase_box = [&](const typename Tree::AABB& box) {
+    model.erase(std::remove_if(model.begin(), model.end(),
+                               [&](const Pt& p) { return box.contains(p); }),
+                model.end());
+  };
+  for (int round = 0; round < 3; ++round) {
+    // Kill b and half of a, then refill both without waiting: some inserts
+    // pass through tagged subtrees
+    tree.deleteBoxes({around_b, half_of_a});
+    erase_box(around_b);
+    erase_box(half_of_a);
+    for (int i = 0; i < 5; ++i) {
+      Points more = cluster(rng, 100, i % 2 ? b : Pt{-35, 0, 0}, 2.0f);
+      tree.addPoints(more);
+      model.insert(model.end(), more.begin(), more.end());
+    }
+    tree.waitForRebuild();
+    CHECK(sameAsModel(tree, model, rng));
+    // Kill b again and let the rebuild drop it, then insert where it was
+    tree.deleteBox(around_b, true);
+    erase_box(around_b);
+    Points more = cluster(rng, 300, b, 2.0f);
+    tree.addPoints(more, true);
+    model.insert(model.end(), more.begin(), more.end());
+    CHECK(sameAsModel(tree, model, rng));
+  }
+}
+
 // Batches that arrive while the worker drains the pending buffer used to be
 // stranded there once the rebuild flag flipped back.
+template <typename Tree>
 void testNoPointsLostDuringRebuild() {
   std::printf("[no points lost during rebuild]\n");
   std::mt19937 rng(2);
@@ -349,6 +490,7 @@ void testNoPointsLostDuringRebuild() {
 
 #ifdef LIKD_TREE_STATS
 // Skewed batches without waiting: the statistics see the rebuild rounds.
+template <typename Tree>
 void testRebuildStats() {
   std::printf("[rebuild statistics]\n");
   std::mt19937 rng(13);
@@ -356,7 +498,7 @@ void testRebuildStats() {
   tree.build(blob(rng, 1000));
   for (int i = 0; i < 100; ++i) tree.addPoints(blob(rng, 2000, 0.5f));
   tree.waitForRebuild();
-  Tree::RebuildStats s = tree.rebuildStats();
+  typename Tree::RebuildStats s = tree.rebuildStats();
   CHECK(s.rounds > 0);
   CHECK(s.max_round_ms > 0);
   // Whether writes got queued depends on timing
@@ -364,6 +506,7 @@ void testRebuildStats() {
 }
 #endif
 
+template <typename Tree>
 void testWaitForRebuild() {
   std::printf("[wait_for_rebuild]\n");
   std::mt19937 rng(3);
@@ -379,6 +522,7 @@ void testWaitForRebuild() {
 }
 
 // The returned point is a copy and stays valid after its node is rebuilt.
+template <typename Tree>
 void testNearestIsCopy() {
   std::printf("[single query returns a copy]\n");
   std::mt19937 rng(4);
@@ -391,6 +535,7 @@ void testNearestIsCopy() {
   CHECK(nearest->x == before.x && nearest->y == before.y);
 }
 
+template <typename Tree>
 void testConcurrentWriters() {
   std::printf("[concurrent writers]\n");
   std::mt19937 rng(5);
@@ -418,6 +563,7 @@ void testConcurrentWriters() {
 }
 
 // Readers run while a writer inserts and occasionally calls build().
+template <typename Tree>
 void testReadersDuringWritesAndBuild() {
   std::printf("[readers during writes and build]\n");
   std::mt19937 rng(6);
@@ -448,7 +594,7 @@ void testReadersDuringWritesAndBuild() {
       tree.build(last);
     } else if (i % 7 == 6) {
       float cx = u(rng), cy = u(rng);
-      Tree::AABB box({cx - 10, cy - 10, -100}, {cx + 10, cy + 10, 100});
+      typename Tree::AABB box({cx - 10, cy - 10, -100}, {cx + 10, cy + 10, 100});
       tree.deleteBox(box);
       last.erase(std::remove_if(last.begin(), last.end(),
                                 [&](const Pt& p) { return box.contains(p); }),
@@ -467,25 +613,44 @@ void testReadersDuringWritesAndBuild() {
   CHECK(matchesBruteForce(tree, last, rng, 100));
 }
 
+template <typename Tree>
+void bruteForceTests(const char* label) {
+  std::printf("== brute force, %s\n", label);
+  testIncrementalQueries<Tree>();
+  testKnnSearch<Tree>();
+  testBoxSearch<Tree>();
+  testDeleteDifferential<Tree>();
+  testDeleteTies<Tree>();
+  testDeleteAll<Tree>();
+  testMemoryUsage<Tree>();
+  testDuplicates<Tree>();
+  testEmptiedLeaves<Tree>();
+  testInsertAfterDeletingSubtrees<Tree>();
+}
+
+template <typename Tree>
+void concurrencyTests(const char* label) {
+  std::printf("== concurrency, %s\n", label);
+  testNoPointsLostDuringRebuild<Tree>();
+#ifdef LIKD_TREE_STATS
+  testRebuildStats<Tree>();
+#endif
+  testWaitForRebuild<Tree>();
+  testNearestIsCopy<Tree>();
+  testConcurrentWriters<Tree>();
+  testReadersDuringWritesAndBuild<Tree>();
+}
+
 }  // namespace
 
 int main() {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
-  testIncrementalQueries();
-  testKnnSearch();
-  testBoxSearch();
-  testDeleteDifferential();
-  testDeleteTies();
-  testDeleteAll();
-  testMemoryUsage();
-  testNoPointsLostDuringRebuild();
-#ifdef LIKD_TREE_STATS
-  testRebuildStats();
-#endif
-  testWaitForRebuild();
-  testNearestIsCopy();
-  testConcurrentWriters();
-  testReadersDuringWritesAndBuild();
+  bruteForceTests<LeafTree<2>>("leaf size 2");
+  bruteForceTests<LeafTree<4>>("leaf size 4");
+  bruteForceTests<KDTree<Pt>>("default leaf size (32)");
+  bruteForceTests<LeafTree<64>>("leaf size 64");
+  concurrencyTests<LeafTree<2>>("leaf size 2");
+  concurrencyTests<KDTree<Pt>>("default leaf size (32)");
   if (g_failures) {
     std::printf("%d check(s) FAILED\n", g_failures);
     return 1;
