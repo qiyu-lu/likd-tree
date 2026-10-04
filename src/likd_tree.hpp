@@ -147,6 +147,14 @@ class KDTree {
   void build(const PointVector<PointType>& pts, Stamp stamp);
   void addPoints(const PointVector<PointType>& pts, Stamp stamp,
                  bool wait_for_rebuild = false);
+  // With Options::TRACK_STAMPS only. Raises the stamp of every stored copy of
+  // each point (exact coordinates) to `stamp`; copies stamped later keep
+  // theirs. A point given several times is touched once.
+  void touchPoints(const PointVector<PointType>& pts, Stamp stamp,
+                   bool wait_for_rebuild = false);
+  // With Options::TRACK_STAMPS only. Deletes every point stamped before
+  // `stamp`; points stamped Stamp::kNever never expire.
+  void expireBefore(Stamp stamp, bool wait_for_rebuild = false);
   // Deletes one stored copy of each point whose coordinates match exactly:
   // with Options::TRACK_STAMPS, the one with the oldest stamp.
   void deletePoints(const PointVector<PointType>& pts,
@@ -324,10 +332,10 @@ class KDTree {
   };
 
   // A write queued while a rebuild runs
-  enum class OpType { kInsert, kDeletePoint, kDeleteBox };
+  enum class OpType { kInsert, kDeletePoint, kDeleteBox, kTouch, kExpire };
   struct NoOpStamp {};
   struct OpStamp {
-    uint32_t stamp;  // insert: the new point's stamp
+    uint32_t stamp;  // insert, touch: the stamp; expire: the cutoff
   };
   struct Op : std::conditional_t<TrackStamps, OpStamp, NoOpStamp> {
     OpType type;
@@ -399,6 +407,11 @@ class KDTree {
                   uint32_t& oldest);
   int deleteBoxInternal(Node* node, const AABB& box,
                         std::vector<Node*>* candidates);
+  bool touchInternal(Node* node, const PointType& pt, uint32_t stamp);
+  int expireInternal(Node* node, uint32_t cutoff,
+                     std::vector<Node*>* candidates);
+  // Recomputes the stamp bounds alone and returns whether they changed
+  static bool refreshStampBounds(Node* node);
   static void killSubtree(Node* node);
   static void pushDown(Inner* node);
   static bool samePoint(const PointType& a, const PointType& b);
@@ -677,6 +690,54 @@ void KDTree<PointType, Traits, Options>::addPoints(const PointVector<PointType>&
                 "addPoints() with a Stamp needs Options::TRACK_STAMPS");
   if constexpr (TrackStamps)
     insertPoints(pts, stamp.value, wait_for_rebuild);
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::touchPoints(
+    const PointVector<PointType>& pts, Stamp stamp, bool wait_for_rebuild) {
+  static_assert(TrackStamps,
+                "touchPoints() needs Options::TRACK_STAMPS");
+  if constexpr (TrackStamps) {
+    // A point is often among the neighbors of several queries: touch it once
+    PointVector<PointType> unique = pts;
+    std::sort(unique.begin(), unique.end(),
+              [](const PointType& a, const PointType& b) {
+                for (int i = 0; i < Traits::DIM; ++i) {
+                  if (Traits::coord(a, i) != Traits::coord(b, i))
+                    return Traits::coord(a, i) < Traits::coord(b, i);
+                }
+                return false;
+              });
+    unique.erase(std::unique(unique.begin(), unique.end(), samePoint),
+                 unique.end());
+    write(
+        unique.size(),
+        [&](size_t i, std::vector<Node*>* /*candidates*/) {
+          touchInternal(root_, unique[i], stamp.value);
+        },
+        [&](size_t i) {
+          return makeOp(OpType::kTouch, unique[i], AABB(), stamp.value);
+        },
+        wait_for_rebuild);
+  }
+}
+
+template <typename PointType, typename Traits, typename Options>
+void KDTree<PointType, Traits, Options>::expireBefore(Stamp stamp,
+                                             bool wait_for_rebuild) {
+  static_assert(TrackStamps,
+                "expireBefore() needs Options::TRACK_STAMPS");
+  if constexpr (TrackStamps) {
+    write(
+        1,
+        [&](size_t, std::vector<Node*>* candidates) {
+          expireInternal(root_, stamp.value, candidates);
+        },
+        [&](size_t) {
+          return makeOp(OpType::kExpire, PointType(), AABB(), stamp.value);
+        },
+        wait_for_rebuild);
+  }
 }
 
 template <typename PointType, typename Traits, typename Options>
@@ -1238,6 +1299,14 @@ void KDTree<PointType, Traits, Options>::applyOp(const Op& op,
     case OpType::kDeleteBox:
       deleteBoxInternal(root_, op.box, candidates);
       break;
+    case OpType::kTouch:
+      if constexpr (TrackStamps)
+        touchInternal(root_, op.point, op.stamp);
+      break;
+    case OpType::kExpire:
+      if constexpr (TrackStamps)
+        expireInternal(root_, op.stamp, candidates);
+      break;
   }
 }
 
@@ -1454,6 +1523,112 @@ int KDTree<PointType, Traits, Options>::deleteBoxInternal(
     markIfUnbalanced(inner, candidates);
   }
   return removed;
+}
+
+// Raises the stamp of every copy of pt below node and returns whether node's
+// stamp bounds changed: if they did not, its ancestors' cannot have either.
+// Like deletePointInternal, it descends by bounding box.
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::touchInternal(
+    [[maybe_unused]] Node* node, [[maybe_unused]] const PointType& pt,
+    [[maybe_unused]] uint32_t stamp) {
+  if constexpr (TrackStamps) {
+    // Below a node whose points are all stamped this late, nothing changes
+    if (!node || node->valid == 0 || node->t_min >= stamp ||
+        !node->aabb.contains(pt))
+      return false;
+    if (node->is_leaf) {
+      Leaf* leaf = asLeaf(node);
+      uint32_t* stamps = stampsOf(leaf);
+      bool touched = false;
+      forEachValid(leaf, [&](int i) {
+        if (stamps[i] < stamp && samePoint(leaf->pts[i], pt)) {
+          stamps[i] = stamp;
+          touched = true;
+        }
+      });
+      return touched && refreshStampBounds(leaf);
+    }
+    Inner* inner = asInner(node);
+    bool changed = touchInternal(inner->left, pt, stamp);
+    changed = touchInternal(inner->right, pt, stamp) || changed;
+    return changed && refreshStampBounds(inner);
+  } else {
+    return false;
+  }
+}
+
+// Deletes the points stamped before cutoff, like deleteBoxInternal along
+// time: a subtree stamped entirely before it gets the lazy tag in O(1).
+// Returns the number of points deleted.
+template <typename PointType, typename Traits, typename Options>
+int KDTree<PointType, Traits, Options>::expireInternal(
+    [[maybe_unused]] Node* node, [[maybe_unused]] uint32_t cutoff,
+    [[maybe_unused]] std::vector<Node*>* candidates) {
+  if constexpr (TrackStamps) {
+    if (!node || node->valid == 0 || node->t_min >= cutoff)
+      return 0;
+    if (node->t_max < cutoff) {
+      int removed = node->valid;
+      killSubtree(node);
+      if (!node->is_leaf)
+        markIfUnbalanced(asInner(node), candidates);
+      return removed;
+    }
+    if (node->is_leaf) {
+      Leaf* leaf = asLeaf(node);
+      const uint32_t* stamps = stampsOf(leaf);
+      int removed = 0;
+      forEachValid(leaf, [&](int i) {
+        if (stamps[i] < cutoff) {
+          leaf->deleted |= bit(i);
+          ++removed;
+        }
+      });
+      if (removed > 0)
+        updateLeaf(leaf);
+      return removed;
+    }
+    Inner* inner = asInner(node);
+    int removed = expireInternal(inner->left, cutoff, candidates);
+    removed += expireInternal(inner->right, cutoff, candidates);
+    if (removed > 0) {
+      updateInner(inner);
+      markIfUnbalanced(inner, candidates);
+    }
+    return removed;
+  } else {
+    return 0;
+  }
+}
+
+template <typename PointType, typename Traits, typename Options>
+bool KDTree<PointType, Traits, Options>::refreshStampBounds(
+    [[maybe_unused]] Node* node) {
+  if constexpr (TrackStamps) {
+    uint32_t t_min = Stamp::kNever, t_max = 0;
+    if (node->is_leaf) {
+      const Leaf* leaf = asLeaf(node);
+      const uint32_t* stamps = stampsOf(leaf);
+      forEachValid(leaf, [&](int i) {
+        t_min = std::min(t_min, stamps[i]);
+        t_max = std::max(t_max, stamps[i]);
+      });
+    } else {
+      for (const Node* child : {asInner(node)->left, asInner(node)->right}) {
+        if (child && child->valid > 0) {
+          t_min = std::min(t_min, child->t_min);
+          t_max = std::max(t_max, child->t_max);
+        }
+      }
+    }
+    bool changed = t_min != node->t_min || t_max != node->t_max;
+    node->t_min = t_min;
+    node->t_max = t_max;
+    return changed;
+  } else {
+    return false;
+  }
 }
 
 // Deletes every point below node in O(1): a leaf marks all its slots, an

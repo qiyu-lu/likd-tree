@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -1113,6 +1114,100 @@ void testStampQueries() {
   }
 }
 
+// Random inserts, touches, expiries and deletes against a brute-force model,
+// without waiting, so that many of them go through the queue in order. A
+// touch raises every copy of a point; an expiry deletes every point stamped
+// before its cutoff, except those stamped kNever.
+template <typename Tree>
+void testTouchAndExpire() {
+  std::printf("[touch and expire]\n");
+  using Stamp = typename Tree::Stamp;
+  std::mt19937 rng(24);
+  std::uniform_real_distribution<float> u(-50.0f, 50.0f);
+  std::vector<StampedPt> model;
+  auto record = [&](const Points& pts, uint32_t stamp) {
+    for (const auto& p : pts) model.push_back({p, stamp});
+  };
+  auto touch = [&](const Points& pts, uint32_t stamp) {
+    std::set<std::array<float, 3>> touched;
+    for (const auto& p : pts) touched.insert({p.x, p.y, p.z});
+    for (auto& e : model)
+      if (touched.count({e.p.x, e.p.y, e.p.z})) e.stamp = std::max(e.stamp, stamp);
+  };
+  auto expire = [&](uint32_t cutoff) {
+    model.erase(std::remove_if(model.begin(), model.end(),
+                               [&](const StampedPt& e) { return e.stamp < cutoff; }),
+                model.end());
+  };
+  // A touch queued before an expiry saves the points it touches
+  Tree tree;
+  Points first = gridBlob(rng, 2000);
+  tree.build(first, Stamp{5});
+  record(first, 5);
+  Points saved(first.begin(), first.begin() + 500);
+  tree.touchPoints(saved, Stamp{10});
+  touch(saved, 10);
+  tree.expireBefore(Stamp{8}, true);
+  expire(8);
+  CHECK(tree.validate());
+  CHECK(storedStamps(tree) == entriesOf(model));
+  CHECK(tree.size() == static_cast<int>(model.size()));
+  uint32_t now = 10;
+  for (int round = 0; round < 400; ++round) {
+    int kind = rng() % 12;
+    if (kind < 4) {
+      Points b = gridBlob(rng, 50 + rng() % 400);
+      if (kind == 0) {
+        tree.addPoints(b);
+        record(b, Stamp::kNever);
+      } else {
+        now += 1 + rng() % 3;
+        tree.addPoints(b, Stamp{now});
+        record(b, now);
+      }
+    } else if (kind < 7) {
+      // Stored points, often the same one twice, and one that is absent
+      Points t;
+      for (int i = 0; i < 200 && !model.empty(); ++i)
+        t.push_back(model[rng() % model.size()].p);
+      t.push_back({1000.0f, 1000.0f, 1000.0f});
+      now += rng() % 2;
+      tree.touchPoints(t, Stamp{now});
+      touch(t, now);
+    } else if (kind < 9) {
+      uint32_t cutoff = now > 40 ? now - 10 - rng() % 30 : rng() % 3;
+      tree.expireBefore(Stamp{cutoff});
+      expire(cutoff);
+    } else if (kind < 11) {
+      Points del;
+      for (int i = 0; i < 100 && !model.empty(); ++i)
+        del.push_back(model[rng() % model.size()].p);
+      tree.deletePoints(del);
+      for (const auto& p : del) eraseOldest(model, p);
+    } else {
+      float cx = u(rng), cy = u(rng), h = 2.0f + rng() % 15;
+      typename Tree::AABB box({cx - h, cy - h, -100.0f}, {cx + h, cy + h, 100.0f});
+      tree.deleteBox(box);
+      model.erase(std::remove_if(model.begin(), model.end(),
+                                 [&](const StampedPt& e) { return box.contains(e.p); }),
+                  model.end());
+    }
+    if (round % 20 == 19) {
+      tree.waitForRebuild();
+      CHECK(tree.validate());
+      CHECK(storedStamps(tree) == entriesOf(model));
+      for (uint32_t min_stamp : {0u, now / 2, now, Stamp::kNever})
+        CHECK(sameAsStampedModel(tree, model, min_stamp, rng));
+    }
+  }
+  // Everything but the points that never expire
+  tree.expireBefore(Stamp{Stamp::kNever}, true);
+  expire(Stamp::kNever);
+  CHECK(tree.validate());
+  CHECK(storedStamps(tree) == entriesOf(model));
+  CHECK(tree.size() == static_cast<int>(model.size()));
+}
+
 // N is the tree's leaf size
 template <typename Tree, int N>
 void bruteForceTests(const char* label) {
@@ -1138,6 +1233,7 @@ void stampTests(const char* label) {
   std::printf("== stamps, %s\n", label);
   testStampsFollowPoints<Tree>();
   testStampQueries<Tree>();
+  testTouchAndExpire<Tree>();
 }
 
 template <typename Tree>
