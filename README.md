@@ -23,36 +23,56 @@ For details see [Python Usage](#python-usage)
 
 ## 🚀 Key Features
 
-- **🔄 Incremental**: Dynamic point insertion with automatic background rebalancing
-- **🪶 Lightweight**: Header-only library (~450 lines of clean C++17) - no build required
-- **⚡ Fast**: 2.44x faster incremental insertion than ikd-tree
+- **🔄 Incremental**: Dynamic point insertion and deletion (by point or by box) with automatic background rebalancing
+- **🔍 Queries**: Nearest neighbor, k-nearest neighbors, radius and box search
+- **🪶 Lightweight**: Header-only library (~1100 lines of C++17) - no build required
+- **⚡ Fast**: On a 1.7M-point LiDAR map, 2.3x faster incremental insertion, 1.4x faster 5-NN search and 20x faster box deletion than ikd-tree
 - **🧠 Intelligent**: Smarter rebalance strategy with delayed and batched rebuilding of multiple non-overlapping unbalanced subtrees *(paper-worthy?)* 
 - **🔧 Flexible**: Support for custom point types via PointTraits template - use any point representation (arrays, getters, etc.)
 
 ## 📊 Performance Comparison
 
-Benchmark on 100K random 3D points (Intel CPU, -O3 optimization, with TBB parallel execution):
+Both trees answer the same queries with the same threading (both sequential,
+or both TBB-parallel). Each frame is queried against the map before it is
+inserted, as in LiDAR odometry. AMD Ryzen 7 7700, GCC 9.4, -O3.
 
-### Batch Build Performance
-| Metric | likd-tree | ikd-tree | Speedup |
-|--------|-----------|----------|---------|
-| Build Time | 23.70 ms | 36.70 ms | **1.55x** |
-| Query Time (1000 queries) | 1.23 ms | 1.30 ms | **1.06x** |
-
-### Incremental Insertion Performance
-100K points inserted in batches of 1000:
+### Real LiDAR map
+`test/pcd/globalMap.pcd` (1.74M points) streamed in file order, 2000-point frames:
 
 | Metric | likd-tree | ikd-tree | Speedup |
 |--------|-----------|----------|---------|
-| Total Insert Time | 84.04 ms | 151.82 ms | **1.81x**⭐ |
-| Total Query Time | 17.37 ms | 71.38 ms | **4.11x**⭐  |
+| Batch build, all points | 119 ms | 583 ms | **4.9x** |
+| Insert, total | 1236 ms | 2786 ms | **2.3x** |
+| Insert, worst frame | 8.9 ms | 54.9 ms | **6.2x** |
+| 1-NN queries, sequential | 2081 ms | 2734 ms | **1.3x** |
+| 5-NN queries, sequential | 3802 ms | 5278 ms | **1.4x** |
+| 5-NN queries, TBB | 533 ms | 710 ms | **1.3x** |
 
+Local map kept to a 100 m cube around the sensor, box deletion every 10 frames:
+
+| Metric | likd-tree | ikd-tree | Speedup |
+|--------|-----------|----------|---------|
+| Box deletion, total | 13.6 ms | 293.5 ms | **21.6x** |
+| Nodes in memory (78,334 valid points) | 78,338 | 236,611 | |
+
+### 100K uniform random points
+1000-point frames:
+
+| Metric | likd-tree | ikd-tree | Speedup |
+|--------|-----------|----------|---------|
+| Insert, total | 34.5 ms | 84.9 ms | **2.5x** |
+| 5-NN queries, sequential | 163.7 ms | 207.7 ms | **1.3x** |
+| 5-NN queries, TBB | 24.6 ms | 28.0 ms | **1.1x** |
+
+Earlier versions of this README compared TBB-parallel likd-tree queries with
+sequential ikd-tree queries; the query numbers above are like-for-like.
 
 ### Reproduce these results:
 ```bash
 cmake -B build -DBUILD_BENCHMARK=ON
 cmake --build build
-./build/benchmark
+./build/benchmark                           # random points
+./build/benchmark ./test/pcd/globalMap.pcd  # real map + local-map test
 ```
 
 ## 🎯 Quick Start
@@ -86,10 +106,25 @@ PointVector<PointType> results;
 std::vector<float> distances;
 tree.nearestNeighbors(queries, results, distances);
 
-// Radius search
+// Single query: returns a copy of the point (std::optional) and its distance
 PointType query;
+auto [nearest, dist] = tree.nearestNeighbors(query);
+if (nearest) { /* use nearest->x, ... */ }
+
+// k nearest neighbors, sorted by distance (optionally within max_dist)
+tree.knnSearch(query, 5, results, distances);
+
+// Radius search
 float radius = 2.0f;
 tree.radiusSearch(query, radius, results, distances);
+
+// Box search (boundary included)
+KDTree<PointType>::AABB box({-1.0f, -1.0f, -1.0f}, {1.0f, 1.0f, 1.0f});
+tree.boxSearch(box, results);
+
+// Delete points (exact coordinates) or everything inside boxes
+tree.deletePoints(points_to_remove);
+tree.deleteBox(box);
 ```
 
 **To enable TBB parallel acceleration:**
@@ -98,6 +133,14 @@ tree.radiusSearch(query, radius, results, distances);
 
 **To disable TBB (sequential execution):**
 - Simply don't define `LIKD_TREE_USE_TBB`, or comment it out
+
+**Thread safety:**
+- Queries can run from any number of threads, concurrently with writes.
+- Writers (`build`, `addPoints`, `deletePoints`, `deleteBox(es)`) are serialized internally.
+- Rebalancing runs on a background thread. Writes issued while it runs are
+  queued and applied in order right after, so a query may briefly not see
+  them. Call `waitForRebuild()` (or pass `wait_for_rebuild = true`) when they
+  must be visible.
 
 ### Custom Point Types
 
@@ -262,6 +305,17 @@ For terminal-only validation:
 ./build/radius_search_pcd_demo <map.pcd> <qx> <qy> <qz> <radius> --no-vis
 ```
 
+### Run Unit Tests
+
+```bash
+cmake -B build
+cmake --build build
+(cd build && ctest --output-on-failure)
+```
+
+The tests compare every query type against brute force, including random
+mixes of insertion and deletion, and exercise concurrent readers and writers.
+
 ### Run Benchmark (Compare with ikd-tree)
 
 ```bash
@@ -284,8 +338,7 @@ cmake --build build
 ## 📋 TODO
 
 **Planned Features:**
-- [ ] Node deletion support (Node deletion not supported now)
-- [ ] k-nearest neighbors (k-NN) query
-- [ ] box queries
-
-> **Note:** If you require these features immediately, consider using [ikd-tree](https://github.com/hku-mars/ikd-Tree) instead.
+- [x] Node deletion (by point and by box)
+- [x] k-nearest neighbors (k-NN) query
+- [x] box queries
+- [ ] Python bindings for k-NN, radius/box search and deletion
