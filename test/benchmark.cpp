@@ -10,8 +10,10 @@
 // built or fed alone, divided by the points it holds. RSS growth is printed
 // next to it because the heap figure leaves out fragmentation.
 
-// Enable TBB parallel execution (define before including likd_tree.hpp)
+// Enable TBB parallel execution and rebuild statistics (define before
+// including likd_tree.hpp)
 #define LIKD_TREE_USE_TBB
+#define LIKD_TREE_STATS
 
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
@@ -142,6 +144,23 @@ void printLikd(const char* name, double likd, const char* unit) {
   printf("  %-28s likd-tree %9.2f %s\n", name, likd, unit);
 }
 
+void printLikdCount(const char* name, size_t likd, const char* unit) {
+  printf("  %-28s likd-tree %9zu %s\n", name, likd, unit);
+}
+
+// Total number of points found by `search` over all queries
+template <typename Search>
+size_t countResults(const PointVector<PointType>& qs, Search search) {
+  size_t found = 0;
+  PointVector<PointType> res;
+  for (const auto& q : qs) {
+    res.clear();
+    search(q, res);
+    found += res.size();
+  }
+  return found;
+}
+
 // Boxes that delete everything outside a cube of half size `half` around the
 // batch centroid (like FAST-LIO's map segmentation)
 std::vector<LikdTree::AABB> localMapBoxes(const PointVector<PointType>& batch,
@@ -166,16 +185,18 @@ std::vector<LikdTree::AABB> localMapBoxes(const PointVector<PointType>& batch,
   return boxes;
 }
 
+BoxPointType toIkdBox(const LikdTree::AABB& box) {
+  BoxPointType b;
+  for (int i = 0; i < 3; ++i) {
+    b.vertex_min[i] = box.min[i];
+    b.vertex_max[i] = box.max[i];
+  }
+  return b;
+}
+
 std::vector<BoxPointType> toIkdBoxes(const std::vector<LikdTree::AABB>& boxes) {
   std::vector<BoxPointType> out;
-  for (const auto& box : boxes) {
-    BoxPointType b;
-    for (int i = 0; i < 3; ++i) {
-      b.vertex_min[i] = box.min[i];
-      b.vertex_max[i] = box.max[i];
-    }
-    out.push_back(b);
-  }
+  for (const auto& box : boxes) out.push_back(toIkdBox(box));
   return out;
 }
 
@@ -271,6 +292,11 @@ void runStream(const PointVector<PointType>& pts, size_t frame,
   printf("  likd-tree final wait for rebuild: %.2f ms\n", wait_ms);
   printf("  5-NN answers from a map with queued writes (likd-tree): %.3f%%\n",
          100.0 * stale / total);
+  LikdTree::RebuildStats rs = likd.rebuildStats();
+  printLikdCount("Rebuild rounds", rs.rounds, "");
+  printLikd("Longest rebuild round", rs.max_round_ms, "ms");
+  printLikdCount("Most writes queued", rs.max_queued_ops, "ops");
+  printLikd("Longest queued-write wait", rs.max_queued_ms, "ms");
   delete ikd;
 }
 
@@ -368,9 +394,12 @@ int main(int argc, char** argv) {
   // ============================================================
   // Part 1: Batch Build Test (Build all points at once)
   // ============================================================
-  std::cout << "\n=== Part 1: Batch build + 1000 queries ===" << std::endl;
+  std::cout << "\n=== Part 1: Batch build + 200k queries ===" << std::endl;
   {
     const long n = static_cast<long>(pts.size());
+    // Radius and box half size giving tens to a hundred points per query
+    const float radius = argc > 1 ? 1.0f : 10.0f;
+    const float box_half = radius;
     LikdTree likd;
     releaseFreeMemory();
     MemorySample m0 = MemorySample::now();
@@ -387,7 +416,7 @@ int main(int argc, char** argv) {
     MemorySample m3 = MemorySample::now();
     std::mt19937 rng(7);
     std::normal_distribution<float> noise(0.0f, 0.05f);
-    PointVector<PointType> queries(1000);
+    PointVector<PointType> queries(200000);
     for (size_t i = 0; i < queries.size(); ++i) {
       queries[i] = pts[(i * 7919) % pts.size()];
       queries[i].x += noise(rng);
@@ -403,9 +432,52 @@ int main(int argc, char** argv) {
     auto q3 = Clock::now();
     ikdKnn(*ikd, queries, K, false);
     auto q4 = Clock::now();
+
+    // Radius and box search on the first 20k queries
+    PointVector<PointType> range_queries(queries.begin(), queries.begin() + 20000);
+    std::vector<float> dists;
+    auto r0 = Clock::now();
+    size_t likd_in_radius = countResults(
+        range_queries, [&](const PointType& q, PointVector<PointType>& res) {
+          likd.radiusSearch(q, radius, res, dists);
+        });
+    auto r1 = Clock::now();
+    size_t ikd_in_radius = countResults(
+        range_queries, [&](const PointType& q, PointVector<PointType>& res) {
+          ikd->Radius_Search(q, radius, res);
+        });
+    auto r2 = Clock::now();
+    auto boxAround = [&](const PointType& q) {
+      return LikdTree::AABB({q.x - box_half, q.y - box_half, q.z - box_half},
+                            {q.x + box_half, q.y + box_half, q.z + box_half});
+    };
+    size_t likd_in_box = countResults(
+        range_queries, [&](const PointType& q, PointVector<PointType>& res) {
+          likd.boxSearch(boxAround(q), res);
+        });
+    auto r3 = Clock::now();
+    size_t ikd_in_box = countResults(
+        range_queries, [&](const PointType& q, PointVector<PointType>& res) {
+          ikd->Box_Search(toIkdBox(boxAround(q)), res);
+        });
+    auto r4 = Clock::now();
+
     printRow("Build", elapsedMs(t0, t1), elapsedMs(t2, t3));
-    printRow("1-NN x1000 (seq)", elapsedMs(q0, q1), elapsedMs(q1, q2));
-    printRow("5-NN x1000 (seq)", elapsedMs(q2, q3), elapsedMs(q3, q4));
+    printRow("1-NN x200k (seq)", elapsedMs(q0, q1), elapsedMs(q1, q2));
+    printRow("5-NN x200k (seq)", elapsedMs(q2, q3), elapsedMs(q3, q4));
+    printRow("Radius search x20k (seq)", elapsedMs(r0, r1), elapsedMs(r1, r2));
+    printRow("Box search x20k (seq)", elapsedMs(r2, r3), elapsedMs(r3, r4));
+    printf("  radius %.1f m: %.1f points per query, box half size %.1f m: %.1f\n",
+           radius, double(likd_in_radius) / range_queries.size(), box_half,
+           double(likd_in_box) / range_queries.size());
+    if (likd_in_radius != ikd_in_radius)
+      printf("  WARNING: radius search found %zu points, ikd-tree %zu\n",
+             likd_in_radius, ikd_in_radius);
+    // ikd-tree's boxes are half-open, [min, max): only likd-tree finds points
+    // lying exactly on a max face
+    if (likd_in_box < ikd_in_box)
+      printf("  WARNING: box search found %zu points, ikd-tree %zu\n",
+             likd_in_box, ikd_in_box);
     printRow("Heap per point", perPoint(m0.heap, m1.heap, n),
              perPoint(m2.heap, m3.heap, n), "B/pt");
     printRow("RSS growth per point", perPoint(m0.rss, m1.rss, n),

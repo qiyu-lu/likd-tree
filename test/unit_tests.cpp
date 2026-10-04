@@ -347,6 +347,23 @@ void testNoPointsLostDuringRebuild() {
   }
 }
 
+#ifdef LIKD_TREE_STATS
+// Skewed batches without waiting: the statistics see the rebuild rounds.
+void testRebuildStats() {
+  std::printf("[rebuild statistics]\n");
+  std::mt19937 rng(13);
+  Tree tree;
+  tree.build(blob(rng, 1000));
+  for (int i = 0; i < 100; ++i) tree.addPoints(blob(rng, 2000, 0.5f));
+  tree.waitForRebuild();
+  Tree::RebuildStats s = tree.rebuildStats();
+  CHECK(s.rounds > 0);
+  CHECK(s.max_round_ms > 0);
+  // Whether writes got queued depends on timing
+  CHECK((s.max_queued_ops == 0) == (s.max_queued_ms == 0));
+}
+#endif
+
 void testWaitForRebuild() {
   std::printf("[wait_for_rebuild]\n");
   std::mt19937 rng(3);
@@ -462,6 +479,9 @@ int main() {
   testDeleteAll();
   testMemoryUsage();
   testNoPointsLostDuringRebuild();
+#ifdef LIKD_TREE_STATS
+  testRebuildStats();
+#endif
   testWaitForRebuild();
   testNearestIsCopy();
   testConcurrentWriters();

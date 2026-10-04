@@ -21,6 +21,7 @@ Distributed under MIT license. See LICENSE for more information.
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <execution>
@@ -144,6 +145,20 @@ class KDTree {
   // it ran, has finished.
   void waitForRebuild() const;
 
+#ifdef LIKD_TREE_STATS
+  // Background rebuild statistics, collected only when LIKD_TREE_STATS is
+  // defined before including this header.
+  struct RebuildStats {
+    size_t rounds = 0;          // rebuild rounds run by the worker
+    double max_round_ms = 0;    // longest round: collect, build, swap, free
+    size_t max_queued_ops = 0;  // most writes waiting in the queue at once
+    // Longest time from queueing a write until the replay that applies it
+    // has finished: how long a write may stay invisible to queries.
+    double max_queued_ms = 0;
+  };
+  RebuildStats rebuildStats() const;
+#endif
+
  private:
   // std::shared_mutex on glibc prefers readers: back-to-back queries from
   // other threads could starve the writers and the rebuild swap forever.
@@ -228,6 +243,12 @@ class KDTree {
   std::vector<Node*> rebuild_job_;
   bool stop_ = false;
   std::thread worker_;
+#ifdef LIKD_TREE_STATS
+  // Guarded by pending_mutex_
+  RebuildStats stats_;
+  // When the oldest write in pending_ops_ was queued
+  std::chrono::steady_clock::time_point queued_since_;
+#endif
 };
 
 // AABB: axis-aligned bounding boxes
@@ -354,7 +375,14 @@ void KDTree<PointType, Traits>::write(ApplyFn&& apply_now, EnqueueFn&& enqueue,
     // be left behind in pending_ops_.
     std::lock_guard<std::mutex> lock(pending_mutex_);
     if (rebuilding_.load()) {
+#ifdef LIKD_TREE_STATS
+      if (pending_ops_.empty())
+        queued_since_ = std::chrono::steady_clock::now();
+#endif
       enqueue(pending_ops_);
+#ifdef LIKD_TREE_STATS
+      stats_.max_queued_ops = std::max(stats_.max_queued_ops, pending_ops_.size());
+#endif
       buffered = true;
     }
   }
@@ -616,6 +644,15 @@ void KDTree<PointType, Traits>::waitForRebuild() const {
   std::unique_lock<std::mutex> lock(pending_mutex_);
   idle_cv_.wait(lock, [this] { return !rebuilding_.load(); });
 }
+
+#ifdef LIKD_TREE_STATS
+template <typename PointType, typename Traits>
+typename KDTree<PointType, Traits>::RebuildStats
+KDTree<PointType, Traits>::rebuildStats() const {
+  std::lock_guard<std::mutex> lock(pending_mutex_);
+  return stats_;
+}
+#endif
 
 template <typename PointType, typename Traits>
 void KDTree<PointType, Traits>::applyOp(const Op& op,
@@ -1062,10 +1099,23 @@ void KDTree<PointType, Traits>::workerLoop() {
     rebuild_job_.clear();
     while (true) {
       lock.unlock();
+#ifdef LIKD_TREE_STATS
+      auto round_start = std::chrono::steady_clock::now();
+#endif
       if (!job.empty()) {
         rebuildSubtrees(job);
       }
+#ifdef LIKD_TREE_STATS
+      std::chrono::duration<double, std::milli> round =
+          std::chrono::steady_clock::now() - round_start;
+#endif
       lock.lock();
+#ifdef LIKD_TREE_STATS
+      if (!job.empty()) {
+        ++stats_.rounds;
+        stats_.max_round_ms = std::max(stats_.max_round_ms, round.count());
+      }
+#endif
       // Leave the rebuilding state only after seeing an empty queue while
       // holding pending_mutex_: writers check rebuilding_ under this lock.
       if (pending_ops_.empty()) {
@@ -1073,6 +1123,9 @@ void KDTree<PointType, Traits>::workerLoop() {
       }
       OpLog ops = std::move(pending_ops_);
       pending_ops_.clear();
+#ifdef LIKD_TREE_STATS
+      auto queued_since = queued_since_;
+#endif
       lock.unlock();
 
       // Replay in order, in small batches to allow queries to interleave.
@@ -1089,6 +1142,11 @@ void KDTree<PointType, Traits>::workerLoop() {
         }
       }
       lock.lock();
+#ifdef LIKD_TREE_STATS
+      std::chrono::duration<double, std::milli> queued =
+          std::chrono::steady_clock::now() - queued_since;
+      stats_.max_queued_ms = std::max(stats_.max_queued_ms, queued.count());
+#endif
     }
     rebuilding_ = false;
     idle_cv_.notify_all();
