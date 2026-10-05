@@ -1,4 +1,4 @@
 build/*
-python/*.so
 /.cache/
+.vscode/
 test/pcd/*.pcd
