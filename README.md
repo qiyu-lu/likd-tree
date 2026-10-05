@@ -40,7 +40,7 @@ KDTree<PointType, PointTraits<PointType>, MyOptions> tree;
 ```
 
 The default is 32. On the benchmark maps, 64 saves another 10% of memory
-but makes 5-NN queries up to 13% slower, and 16 needs about 31 bytes per
+but makes 5-NN queries up to 14% slower, and 16 needs about 31 bytes per
 point.
 
 ## Python Version
@@ -65,7 +65,7 @@ For details see [Python Usage](#python-usage)
 - **⏱️ Time-aware (optional)**: Per-point stamps to refresh the points a scan sees again, expire those not seen for a while, and query only recent ones, in the spirit of Redis' LRU and TTL
 - **🪶 Lightweight**: Header-only library (~2100 lines of C++17) - no build required
 - **📦 Compact**: About 25 bytes per `pcl::PointXYZ` point, a sixth of ikd-tree's: points are stored in leaf buckets
-- **⚡ Fast**: On a 1.3M-point LiDAR map streamed in scan-sized frames, 3.9x faster incremental insertion, 5.4x faster 5-NN search and 30x faster box deletion than ikd-tree
+- **⚡ Fast**: On a 1.3M-point LiDAR map streamed in scan-sized frames, 3.8x faster incremental insertion, 5.6x faster 5-NN search and 27x faster box deletion than ikd-tree
 - **🧠 Intelligent**: Smarter rebalance strategy with delayed and batched rebuilding of multiple non-overlapping unbalanced subtrees *(paper-worthy?)* 
 - **🔧 Flexible**: Support for custom point types via PointTraits template - use any point representation (arrays, getters, etc.)
 
@@ -87,12 +87,12 @@ span most of the map, so its streaming numbers resemble random insertion.
 
 | Metric | likd-tree | ikd-tree | Speedup |
 |--------|-----------|----------|---------|
-| Batch build, all points | 33 ms | 359 ms | **10.9x** |
-| Insert, total | 352 ms | 1355 ms | **3.9x** |
-| Insert, slowest 1% of frames | 1.1 ms | 19.3 ms | **17x** |
-| 1-NN queries, sequential | 366 ms | 2312 ms | **6.3x** |
-| 5-NN queries, sequential | 773 ms | 4141 ms | **5.4x** |
-| 5-NN queries, TBB | 156 ms | 809 ms | **5.2x** |
+| Batch build, all points | 36 ms | 365 ms | **10.1x** |
+| Insert, total | 353 ms | 1352 ms | **3.8x** |
+| Insert, slowest 1% of frames | 1.1 ms | 21.4 ms | **19.1x** |
+| 1-NN queries, sequential | 360 ms | 2446 ms | **6.8x** |
+| 5-NN queries, sequential | 771 ms | 4291 ms | **5.6x** |
+| 5-NN queries, TBB | 153 ms | 834 ms | **5.5x** |
 | Memory after batch build | 25.3 B/point | 160 B/point | |
 | Memory after streaming | 25.5 B/point | 186 B/point | |
 
@@ -100,32 +100,32 @@ span most of the map, so its streaming numbers resemble random insertion.
 
 | Metric | likd-tree | ikd-tree | Speedup |
 |--------|-----------|----------|---------|
-| Batch build, all points | 51 ms | 577 ms | **11.3x** |
-| Insert, total | 683 ms | 2530 ms | **3.7x** |
-| Insert, slowest 1% of frames | 2.1 ms | 37.4 ms | **18x** |
-| 1-NN queries, sequential | 1153 ms | 2643 ms | **2.3x** |
-| 5-NN queries, sequential | 1839 ms | 4924 ms | **2.7x** |
-| 5-NN queries, TBB | 281 ms | 676 ms | **2.4x** |
+| Batch build, all points | 54 ms | 579 ms | **10.6x** |
+| Insert, total | 707 ms | 2621 ms | **3.7x** |
+| Insert, slowest 1% of frames | 2.2 ms | 42.9 ms | **19.5x** |
+| 1-NN queries, sequential | 1210 ms | 2751 ms | **2.3x** |
+| 5-NN queries, sequential | 1934 ms | 5191 ms | **2.7x** |
+| 5-NN queries, TBB | 299 ms | 712 ms | **2.4x** |
 | Memory after batch build | 25.3 B/point | 160 B/point | |
-| Memory after streaming | 28.1 B/point | 254 B/point | |
+| Memory after streaming | 28.1 B/point | 252 B/point | |
 
 Local map kept to a 100 m cube around the sensor, box deletion every 10
 frames, `Global_map_sprase.pcd`:
 
 | Metric | likd-tree | ikd-tree | Speedup |
 |--------|-----------|----------|---------|
-| Box deletion, total | 0.96 ms | 28.4 ms | **30x** |
+| Box deletion, total | 1.04 ms | 28.6 ms | **27.5x** |
 | Points stored, deleted ones included (105,921 kept) | 105,968 | 107,705 | |
-| Memory per point kept | 26.2 B | 2274 B | |
+| Memory per point kept | 26.2 B | 2272 B | |
 
 ### 100K uniform random points
 1000-point frames:
 
 | Metric | likd-tree | ikd-tree | Speedup |
 |--------|-----------|----------|---------|
-| Insert, total | 24.4 ms | 77.9 ms | **3.2x** |
-| 5-NN queries, sequential | 80.0 ms | 188.2 ms | **2.4x** |
-| 5-NN queries, TBB | 15.7 ms | 27.5 ms | **1.7x** |
+| Insert, total | 24.3 ms | 75.8 ms | **3.1x** |
+| 5-NN queries, sequential | 80.2 ms | 191.0 ms | **2.4x** |
+| 5-NN queries, TBB | 15.3 ms | 27.4 ms | **1.8x** |
 | Memory after streaming | 29.5 B/point | 161 B/point | |
 
 Earlier versions of this README compared TBB-parallel likd-tree queries with
@@ -371,8 +371,8 @@ Example output:
 ```text
 Loaded points: 1742788
 Finite points used: 1742788
-Build time: 318.466372 ms
-Query time: 0.010660 ms
+Build time: 214.243788 ms
+Query time: 0.003400 ms
 Query: (0.900000, 0.100000, 0.000000)
 Nearest: (0.950123, -0.076546, -1.369322)
 Distance: 1.381566
@@ -416,8 +416,8 @@ Example output:
 ```text
 Loaded points: 1742788
 Finite points used: 1742788
-Build time: 330.332208 ms
-Radius search time: 0.029950 ms
+Build time: 208.635532 ms
+Radius search time: 0.013770 ms
 Query: (0.900000, 0.100000, 0.000000)
 Radius: 2.000000
 Radius search points: 193
@@ -469,7 +469,10 @@ glibc's `mallinfo()`, RSS growth, and `memoryUsage()`. It also defines
 queued write waited before queries could see it. To compare against static
 nanoflann trees (1.5.0 or newer) as well, pass
 `-DNANOFLANN_INCLUDE_DIR=<dir>` to CMake, or add
-`-DLIKD_BENCH_NANOFLANN -I<dir>` to the command above.
+`-DLIKD_BENCH_NANOFLANN -I<dir>` to the command above. Adding
+`-DLIKD_BENCH_STAMPS` makes likd-tree keep stamps: Parts 1–3 then show what
+they cost, Part 4 replays Part 2 touching each frame's 5-NN neighbors, and on
+a map Part 5 replaces Part 3's box with a time to live of 50 frames.
 
 **Comparing two versions.** Single runs on the same machine can differ by 10%
 or more, so a few runs of each version can't show a 5% change.
