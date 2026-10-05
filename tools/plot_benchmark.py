@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Draws the benchmark summary chart in the README.
 
-The numbers are the README's table for Global_map_sprase.pcd: medians of 10
+The numbers are the docs/benchmark.md table for Global_map_sprase.pcd: medians of 10
 benchmark runs. Update ROWS when that table changes.
 
   python3 tools/plot_benchmark.py
@@ -11,7 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# (label, likd-tree, ikd-tree, unit, ikd-tree / likd-tree as the README gives
+# (label, likd-tree, ikd-tree, unit, ikd-tree / likd-tree as the table gives
 # it, computed there from unrounded values)
 ROWS = [
     ("Batch build", 36, 365, "ms", 10.1),
