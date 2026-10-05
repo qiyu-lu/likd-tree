@@ -11,23 +11,27 @@ It is inspired by [ikd-Tree](https://github.com/hku-mars/ikd-Tree) and written
 from scratch.
 
 > This repository continues [scomup/likd-tree](https://github.com/scomup/likd-tree)
-> by Liu Yang. See [License & Acknowledgements](#license--acknowledgements).
+> by Liu Yang. See [License & Acknowledgements](#-license--acknowledgements).
 
-## Features
+## 🚀 Key Features
 
-- **Incremental**: insert points, delete by point or by box; rebalancing runs in the background
-- **Queries**: nearest neighbor, k-nearest neighbors, radius and box search
-- **Compact**: about 25 bytes per `pcl::PointXYZ` point, a sixth of ikd-tree's
-- **Fast**: on a 1.3M-point LiDAR map, 3.8x faster insertion, 5.6x faster 5-NN search and 27x faster box deletion than ikd-tree
-- **Time-aware (optional)**: per-point stamps to refresh points seen again, expire old ones, and query only recent ones
-- **Thread-safe**: queries run concurrently with each other and with writes
-- **Flexible**: any point type through `PointTraits`
+- **🔄 Incremental**: Insert points, delete by point or by box, with automatic background rebalancing
+- **🔍 Queries**: Nearest neighbor, k-nearest neighbors, radius and box search
+- **🪶 Lightweight**: Header-only library (~2100 lines of C++17) - no build required
+- **📦 Compact**: About 25 bytes per `pcl::PointXYZ` point, a sixth of ikd-tree's: points are stored in leaf buckets
+- **⚡ Fast**: On a 1.3M-point LiDAR map, 3.8x faster insertion, 5.6x faster 5-NN search and 27x faster box deletion than ikd-tree
+- **🧠 Intelligent**: Delayed and batched rebuilding of multiple non-overlapping unbalanced subtrees *(paper-worthy?)*
+- **⏱️ Time-aware (optional)**: Per-point stamps to refresh points seen again, expire old ones, and query only recent ones, in the spirit of Redis' LRU and TTL
+- **🔒 Thread-safe**: Queries run concurrently with each other and with writes
+- **🔧 Flexible**: Any point type through the `PointTraits` template
+
+## 📊 Performance
 
 ![likd-tree compared with ikd-tree: 10.1x faster batch build, 3.8x faster insertion, 19.1x faster slowest frames, 5.5-6.8x faster nearest-neighbor queries, 27.5x faster box deletion, 7.3x less memory](imgs/benchmark.png)
 
 Full tables, conditions and how to reproduce them: [docs/benchmark.md](docs/benchmark.md).
 
-## Usage
+## 🎯 Quick Start
 
 Copy [`src/likd_tree.hpp`](src/likd_tree.hpp) into your project and include
 it. It needs C++17 and Eigen, nothing else: no build step, and no need to
@@ -162,7 +166,7 @@ KDTree<PointType, PointTraits<PointType>, MyOptions> tree;
 On the benchmark maps, 64 saves another 10% of memory but makes 5-NN queries
 up to 14% slower.
 
-## How it works
+## 🧩 How it works
 
 Points live in leaf buckets and inner nodes only split space. Every node
 keeps the bounding box of its points: searches prune with it, and box
@@ -179,7 +183,7 @@ original one-point-per-node tree):
 ![no-rebuild](imgs/no-rebuild.gif)
 ![rebuild](imgs/rebuild.gif)
 
-## Building the demos, tests and benchmark
+## 🛠️ Demo, Tests & Benchmark
 
 The library needs no build. CMake is only for what is in `test/`:
 
@@ -206,11 +210,11 @@ query on a PCD map, check it against brute force and show it in a viewer
 The benchmark against ikd-tree is built with `-DBUILD_BENCHMARK=ON`, which
 fetches ikd-Tree. See [docs/benchmark.md](docs/benchmark.md).
 
-## TODO
+## 📋 TODO
 
 - [ ] Python bindings
 
-## License & Acknowledgements
+## 📄 License & Acknowledgements
 
 MIT, see [LICENSE](LICENSE). The original likd-tree is © 2026 Liu Yang
 ([scomup/likd-tree](https://github.com/scomup/likd-tree)); changes made in this
