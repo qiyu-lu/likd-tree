@@ -7,6 +7,11 @@ its min and max, the new/base ratio, and the same ratio for ikd-tree. ikd-tree
 is the same code in both executables, so its ratio shows how much the machine
 drifted between the two sets of runs.
 
+Odd rounds run `base` first and even rounds `new` first. A process's first
+large allocations, such as Part 1's build, depend on the process that ran
+just before it: with a fixed order, the same build measured up to 11% slower
+or 10% faster depending only on which executable went first.
+
     python3 test/compare_benchmarks.py build/benchmark_base build/benchmark \
         --map test/pcd/globalMap.pcd --map test/pcd/Global_map_sprase.pcd
 
@@ -67,7 +72,10 @@ def ratio(new, base):
 def compare(base_exe, new_exe, args, runs, label, save_dir):
     results = {"base": [], "new": []}
     for i in range(runs):
-        for kind, exe in (("base", base_exe), ("new", new_exe)):
+        order = [("base", base_exe), ("new", new_exe)]
+        if i % 2 == 1:  # even rounds, counting from 1: new first
+            order.reverse()
+        for kind, exe in order:
             save_to = (os.path.join(save_dir, f"{label}-{kind}-{i}.txt")
                        if save_dir else None)
             print(f"  {label}: {kind} run {i + 1}/{runs}", file=sys.stderr)

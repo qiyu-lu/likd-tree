@@ -483,6 +483,11 @@ python3 test/compare_benchmarks.py build/benchmark_base build/benchmark \
     --map test/pcd/globalMap.pcd --runs 5
 ```
 
+The script swaps which executable runs first every round. A process's first
+large allocations, such as Part 1's build, depend on the process that ran
+just before it: with the baseline always first, a build whose code had not
+changed measured 5–11% slower, and 2–10% faster with the order reversed.
+
 Passing the same executable twice shows the noise floor. The ikd-tree code is
 identical in both executables, so its new/base ratio shows how much the
 machine drifted during the comparison.
