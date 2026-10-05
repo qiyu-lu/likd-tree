@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draws the benchmark summary chart in the README (light and dark versions).
+"""Draws the benchmark summary chart in the README.
 
 The numbers are the README's table for Global_map_sprase.pcd: medians of 10
 benchmark runs. Update ROWS when that table changes.
@@ -24,16 +24,12 @@ ROWS = [
     ("Memory after streaming", 25.5, 186, "B/point", 7.3),
 ]
 
-THEMES = {
-    "light": dict(surface="#fcfcfb", text="#0b0b0b", secondary="#52514e",
-                  grid="#e3e2dd", bar="#2a78d6"),
-    "dark": dict(surface="#1a1a19", text="#ffffff", secondary="#c3c2b7",
-                 grid="#3a3a37", bar="#3987e5"),
-}
+COLORS = dict(surface="#fcfcfb", text="#0b0b0b", secondary="#52514e",
+              grid="#e3e2dd", bar="#2a78d6")
 
 
-def draw(theme, out):
-    c = THEMES[theme]
+def draw(out):
+    c = COLORS
     ratios = [row[4] for row in ROWS]
     fig, ax = plt.subplots(figsize=(10, 5.2), dpi=144)
     fig.patch.set_facecolor(c["surface"])
@@ -72,5 +68,4 @@ def draw(theme, out):
 
 
 if __name__ == "__main__":
-    for theme in THEMES:
-        draw(theme, f"imgs/benchmark_{theme}.png")
+    draw("imgs/benchmark.png")
