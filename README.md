@@ -43,6 +43,9 @@ The default is 32. On the benchmark maps, 64 saves another 10% of memory
 but makes 5-NN queries up to 14% slower, and 16 needs about 31 bytes per
 point.
 
+[docs/design.md](docs/design.md) describes the layout, each operation, the
+rebuild protocol and the rules that make it thread-safe.
+
 ## Python Version
 
 **The python version likd-tree is also available now!🎉** 
@@ -70,6 +73,11 @@ For details see [Python Usage](#python-usage)
 - **🔧 Flexible**: Support for custom point types via PointTraits template - use any point representation (arrays, getters, etc.)
 
 ## 📊 Performance Comparison
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="imgs/benchmark_dark.png">
+  <img alt="likd-tree compared with ikd-tree: 10.1x faster batch build, 3.8x faster insertion, 19.1x faster slowest frames, 5.5-6.8x faster nearest-neighbor queries, 27.5x faster box deletion, 7.3x less memory" src="imgs/benchmark_light.png">
+</picture>
 
 Both trees answer the same queries with the same threading (both sequential,
 or both TBB-parallel). Each frame is queried against the map before it is
@@ -380,10 +388,11 @@ Brute-force distance: 1.381566
 Brute-force check: MATCH
 ```
 
-In the visualization, the original cloud is shown in gray, the query point in
-green, the nearest neighbor in red, and the line between them in yellow:
+The viewer shows the cloud in gray, the query point in green, the nearest
+neighbor in red, and the line between them in yellow. The same result,
+rendered by `tools/render_search_figures.py`:
 
-![nearest-search-pcd](imgs/nearest_search_pcd_result.png)
+![Nearest neighbor search on a LiDAR map: the query point and its nearest neighbor, 1.38 m away](imgs/nearest_search_pcd_result.png)
 
 For terminal-only validation without opening a viewer, pass `--no-vis`:
 
@@ -407,9 +416,10 @@ Example:
 
 The radius demo prints the number of points found, validates the result with
 brute-force search, and visualizes the query point in green, matched radius
-points in red, and the search radius as a green wireframe sphere:
+points in red, and the search radius as a green wireframe sphere. The same
+result, rendered by `tools/render_search_figures.py`:
 
-![radius-search-pcd](imgs/radius_search_pcd_result.png)
+![Radius search on a LiDAR map: the 193 points within 2 m of the query](imgs/radius_search_pcd_result.png)
 
 Example output:
 
@@ -494,6 +504,16 @@ changed measured 5–11% slower, and 2–10% faster with the order reversed.
 Passing the same executable twice shows the noise floor. The ikd-tree code is
 identical in both executables, so its new/base ratio shows how much the
 machine drifted during the comparison.
+
+### Regenerating the figures
+
+```bash
+python3 tools/render_search_figures.py test/pcd/globalMap.pcd  # needs the demos built
+python3 tools/plot_benchmark.py                                # numbers are in the script
+```
+
+The first script runs the two demos, and stops if the points it is about to
+draw are not the ones they found.
 
 ### Rebuild visualization demo
 
